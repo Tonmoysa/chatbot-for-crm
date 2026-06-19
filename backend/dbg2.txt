@@ -1,0 +1,15 @@
+﻿python : Traceback (most recent call last):
+At C:\Users\HP\AppData\Local\Temp\ps-script-e6697771-1afb-40cf-9c96-aacb063d4e89.ps1:80 char:24
++ cd d:\chatbot\backend; python -c "
++                        ~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "<string>", line 9, in <module>
+    print(repr(m), wants_cancel_leave_command(m), wants_defer_expense_for_leave_submit(m))
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u0964' in position 13: character maps to <undefined>
+'cancel leave.' True False

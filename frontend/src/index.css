@@ -1,0 +1,87 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  height: 100%;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+body {
+  height: 100%;
+  height: 100dvh;
+  margin: 0;
+  overflow: hidden;
+  min-height: 100%;
+  min-height: 100dvh;
+  @apply antialiased text-slate-900 dark:bg-navy-950 dark:text-slate-100;
+  background-color: #cbd5e1;
+}
+
+#root {
+  min-height: 100dvh;
+  height: 100dvh;
+  max-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+@layer components {
+  .chat-surface {
+    @apply bg-gradient-to-b from-slate-100/80 via-slate-50/50 to-slate-100/80 dark:from-navy-950 dark:via-navy-900/30 dark:to-navy-950;
+  }
+
+  .chat-scroll {
+    scroll-behavior: smooth;
+    scrollbar-gutter: stable;
+  }
+
+  .chat-scroll::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .chat-scroll::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-slate-300/80 dark:bg-slate-700/80;
+  }
+
+  .glass-input {
+    @apply border border-slate-200/80 bg-white/80 shadow-glass backdrop-blur-xl dark:border-slate-700/60 dark:bg-slate-900/70;
+  }
+
+  .icon-btn {
+    @apply inline-flex size-10 shrink-0 items-center justify-center rounded-xl text-slate-500 transition hover:bg-slate-100/90 hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500/40 disabled:cursor-not-allowed disabled:opacity-50 dark:text-slate-400 dark:hover:bg-slate-800/90 dark:hover:text-slate-100;
+  }
+
+  .mic-btn-idle:hover {
+    @apply text-cyan-600 dark:text-cyan-400;
+    animation: mic-pulse 2s ease-in-out infinite;
+  }
+
+  .send-btn {
+    @apply inline-flex size-10 shrink-0 items-center justify-center rounded-xl bg-slate-200/80 text-slate-400 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed dark:bg-slate-800/80;
+  }
+
+  .send-btn-active {
+    @apply bg-gradient-to-br from-emerald-500 to-emerald-600 text-white shadow-md hover:from-emerald-400 hover:to-emerald-500 hover:shadow-lg;
+  }
+
+  .typing-dot {
+    @apply size-2 rounded-full bg-slate-400 dark:bg-slate-500;
+    animation: typing-bounce 1.2s ease-in-out infinite;
+  }
+
+  .animation-delay-150 {
+    animation-delay: 0.15s;
+  }
+
+  .animation-delay-300 {
+    animation-delay: 0.3s;
+  }
+
+  .prose-chat p + p {
+    @apply mt-2;
+  }
+}

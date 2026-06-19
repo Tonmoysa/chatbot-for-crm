@@ -1,0 +1,23 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.13.1, pytest-9.0.3, pluggy-1.6.0 -- C:\Python313\python.exe
+cachedir: .pytest_cache
+django: version: 5.2.14, settings: config.settings (from ini)
+rootdir: D:\chatbot\backend
+configfile: pytest.ini
+plugins: anyio-4.13.0, django-4.12.0
+collecting ... collected 1 item
+
+tests/test_scenario_35_messages.py::test_scenario_35_messages_e2e FAILED [100%]
+
+============================== warnings summary ===============================
+tests/test_scenario_35_messages.py::test_scenario_35_messages_e2e
+tests/test_scenario_35_messages.py::test_scenario_35_messages_e2e
+tests/test_scenario_35_messages.py::test_scenario_35_messages_e2e
+tests/test_scenario_35_messages.py::test_scenario_35_messages_e2e
+  D:\chatbot\backend\chat\services\crm\mock_crm.py:77: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    "as_of": datetime.utcnow().isoformat() + "Z",
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_scenario_35_messages.py::test_scenario_35_messages_e2e - Fa...
+======================== 1 failed, 4 warnings in 4.59s ========================

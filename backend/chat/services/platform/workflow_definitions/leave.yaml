@@ -1,0 +1,97 @@
+id: leave
+name: Leave Request
+crm_intent: LEAVE_REQUEST
+requires_review: true
+requires_confirmation: true
+
+fields:
+  - name: leave_type
+    type: enum
+    required: true
+    enum: [annual, sick, lwop]
+    prompt_en: "What type of leave would you like? (e.g. annual, sick, lwop)"
+    prompt_bn: "কোন ধরনের ছুটি চান? (যেমন annual, sick, lwop)"
+
+  - name: day_scope
+    type: enum
+    required: true
+    enum: [full_day, half_day]
+    prompt_en: "Is this a full day or half day?"
+    prompt_bn: "পুরো দিন নাকি অর্ধ দিন?"
+
+  - name: half_day_period
+    type: enum
+    conditional:
+      field: day_scope
+      equals: half_day
+    enum: [morning, afternoon]
+    prompt_en: "Which half — morning or afternoon?"
+    prompt_bn: "কোন অর্ধ — সকাল নাকি বিকেল?"
+
+  - name: start_date
+    type: date
+    required: true
+    prompt_en: "When does your leave start?"
+    prompt_bn: "ছুটি কখন থেকে শুরু?"
+
+  - name: end_date
+    type: date
+    optional: true
+    prompt_en: "When does your leave end? (optional for single-day leave)"
+    prompt_bn: "ছুটি কখন শেষ? (এক দিনের ছুটির জন্য ঐচ্ছিক)"
+
+  - name: reason
+    type: text
+    optional: true
+    prompt_en: "Would you like to share a reason? (optional)"
+    prompt_bn: "কারণ জানাতে চান? (ঐচ্ছিক)"
+
+  - name: medical_document
+    type: document
+    conditional:
+      field: leave_type
+      equals: sick
+      min_days: 3
+    prompt_en: "Sick leave of 3+ days requires a medical document. Please upload or describe it."
+    prompt_bn: "৩ দিন বা তার বেশি sick leave-এ medical document লাগবে।"
+
+validation_rules:
+  - id: leave_type_required
+    type: required
+    params: { field: leave_type }
+    message_en: "Leave type is required."
+    message_bn: "ছুটির ধরন প্রয়োজন।"
+
+  - id: day_scope_required
+    type: required
+    params: { field: day_scope }
+    message_en: "Please specify full day or half day."
+    message_bn: "পুরো দিন নাকি অর্ধ দিন জানান।"
+
+  - id: half_day_period_conditional
+    type: conditional_required
+    params: { when_field: day_scope, equals: half_day, require_field: half_day_period }
+    message_en: "Half-day leave requires morning or afternoon."
+    message_bn: "অর্ধ দিনের ছুটিতে সকাল/বিকেল জানান।"
+
+  - id: start_date_required
+    type: required
+    params: { field: start_date }
+    message_en: "Start date is required."
+    message_bn: "শুরুর তারিখ প্রয়োজন।"
+
+  - id: end_date_gte_start
+    type: date_gte
+    params: { field: end_date, gte_field: start_date }
+    message_en: "End date must be on or after start date."
+    message_bn: "শেষ তারিখ শুরুর তারিখের পরে হতে হবে।"
+
+  - id: medical_document_sick
+    type: conditional_required
+    params:
+      when_field: leave_type
+      equals: sick
+      min_days: 3
+      require_field: medical_document
+    message_en: "Sick leave of 3+ days requires a medical document."
+    message_bn: "৩+ দিন sick leave-এ medical document প্রয়োজন।"

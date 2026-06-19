@@ -1,0 +1,80 @@
+id: expense
+name: Expense Claim
+crm_intent: EXPENSE_CLAIM
+requires_review: true
+requires_confirmation: true
+
+fields:
+  - name: incurred_date
+    type: date
+    required: true
+    prompt_en: "When was this expense incurred?"
+    prompt_bn: "খরচ কখন হয়েছে?"
+
+  - name: items
+    type: line_items
+    required: true
+    prompt_en: "Tell me about the expense — category and amount (e.g. lunch 150 taka)."
+    prompt_bn: "খরচের বিবরণ দিন — category ও amount (যেমন lunch 150 taka)।"
+    item_fields:
+      - name: category
+        type: enum
+        required: true
+        enum: [meals, travel, accommodation, supplies, other]
+      - name: amount
+        type: number
+        required: true
+      - name: description
+        type: text
+        optional: true
+
+  - name: from_location
+    type: string
+    conditional:
+      field: items
+      any_item_category: travel
+    prompt_en: "Where did you travel from?"
+    prompt_bn: "কোথা থেকে যাত্রা?"
+
+  - name: to_location
+    type: string
+    conditional:
+      field: items
+      any_item_category: travel
+    prompt_en: "Where did you travel to?"
+    prompt_bn: "কোথায় গিয়েছেন?"
+
+validation_rules:
+  - id: incurred_date_required
+    type: required
+    params: { field: incurred_date }
+    message_en: "Expense date is required."
+    message_bn: "খরচের তারিখ প্রয়োজন।"
+
+  - id: incurred_date_not_future
+    type: date_not_future
+    params: { field: incurred_date }
+    message_en: "Future dates are not allowed for expenses."
+    message_bn: "ভবিষ্যত তারিখ গ্রহণযোগ্য নয়।"
+
+  - id: min_one_item
+    type: min_line_items
+    params: { field: items, min: 1 }
+    message_en: "At least one expense item is required."
+    message_bn: "কমপক্ষে একটি খরচের আইটেম প্রয়োজন।"
+
+  - id: item_amount_positive
+    type: line_item_amount_gt
+    params: { field: items, amount_field: amount, min: 0 }
+    message_en: "Each item amount must be greater than zero."
+    message_bn: "প্রতিটি amount ০-এর বেশি হতে হবে।"
+
+  - id: travel_route_required
+    type: travel_route_required
+    params:
+      items_field: items
+      category: travel
+      from_field: from_location
+      to_field: to_location
+    message_en: "Travel expenses require from and to locations."
+    message_bn: "Travel খরচে from ও to location প্রয়োজন।"
