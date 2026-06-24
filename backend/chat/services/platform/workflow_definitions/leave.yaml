@@ -43,17 +43,18 @@ fields:
   - name: reason
     type: text
     optional: true
-    prompt_en: "Would you like to share a reason? (optional)"
-    prompt_bn: "কারণ জানাতে চান? (ঐচ্ছিক)"
+    prompt_en: "Would you like to share a reason? (optional — reply **skip** to continue)"
+    prompt_bn: "কারণ জানাতে চান? (ঐচ্ছিক — **skip** বললে এড়িয়ে যাব)"
 
   - name: medical_document
     type: document
+    optional: true
     conditional:
       field: leave_type
       equals: sick
       min_days: 3
-    prompt_en: "Sick leave of 3+ days requires a medical document. Please upload or describe it."
-    prompt_bn: "৩ দিন বা তার বেশি sick leave-এ medical document লাগবে।"
+    prompt_en: "For sick leave of 3+ days, you may upload a medical document now (optional — reply **skip** or say you will provide it later)."
+    prompt_bn: "৩+ দিন sick leave-এ medical document দিতে পারেন (ঐচ্ছিক — **skip** বলুন বা পরে দেবেন বলুন)।"
 
 validation_rules:
   - id: leave_type_required
@@ -85,13 +86,3 @@ validation_rules:
     params: { field: end_date, gte_field: start_date }
     message_en: "End date must be on or after start date."
     message_bn: "শেষ তারিখ শুরুর তারিখের পরে হতে হবে।"
-
-  - id: medical_document_sick
-    type: conditional_required
-    params:
-      when_field: leave_type
-      equals: sick
-      min_days: 3
-      require_field: medical_document
-    message_en: "Sick leave of 3+ days requires a medical document."
-    message_bn: "৩+ দিন sick leave-এ medical document প্রয়োজন।"

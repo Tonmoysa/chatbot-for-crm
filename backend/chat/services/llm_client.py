@@ -20,6 +20,26 @@ _JSON_CIRCUIT_THRESHOLD = 3
 _RATE_LIMIT_TRIPPED: set[str] = set()
 
 
+def _circuit_key(trace_id: str, scope: str = "default") -> str:
+    """Scoped circuit id — understanding vs expense-draft do not share one 429 trip."""
+    tid = (trace_id or "").strip()
+    sc = (scope or "default").strip() or "default"
+    if tid:
+        return f"{tid}:{sc}"
+    return sc
+
+
+def llm_rate_limit_active(trace_id: str = "", scope: str = "expense-draft") -> bool:
+    """True when a prior 429 tripped the circuit for this trace (any related scope)."""
+    if _rate_limit_tripped(_circuit_key(trace_id, scope)):
+        return True
+    if _rate_limit_tripped(_circuit_key(trace_id, "default")):
+        return True
+    if _rate_limit_tripped(_circuit_key(trace_id, "understanding")):
+        return True
+    return False
+
+
 def clear_llm_trace_state(trace_id: str = "") -> None:
     """Reset per-trace LLM failure counters / circuits (call once per chat turn)."""
     if not trace_id:
@@ -27,21 +47,38 @@ def clear_llm_trace_state(trace_id: str = "") -> None:
         _RATE_LIMIT_TRIPPED.clear()
         return
     key = trace_id.strip()
-    _JSON_HTTP_FAILURES.pop(key, None)
-    _RATE_LIMIT_TRIPPED.discard(key)
+    for ck in list(_JSON_HTTP_FAILURES.keys()):
+        if ck == key or ck.startswith(f"{key}:"):
+            _JSON_HTTP_FAILURES.pop(ck, None)
+    for ck in list(_RATE_LIMIT_TRIPPED):
+        if ck == key or ck.startswith(f"{key}:"):
+            _RATE_LIMIT_TRIPPED.discard(ck)
 
 
-def _rate_limit_tripped(trace_id: str) -> bool:
-    return bool(trace_id) and trace_id in _RATE_LIMIT_TRIPPED
+def _rate_limit_tripped(circuit_id: str) -> bool:
+    return bool(circuit_id) and circuit_id in _RATE_LIMIT_TRIPPED
 
 
-def _maybe_trip_rate_limit(trace_id: str, exc: Exception) -> None:
-    if not trace_id:
+def _retry_after_seconds(exc: Exception) -> float | None:
+    if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 429:
+        return None
+    try:
+        body = exc.response.text or ""
+    except Exception:
+        body = ""
+    m = re.search(r"try again in ([\d.]+)\s*s", body, re.I)
+    if m:
+        return min(float(m.group(1)) + 0.5, 35.0)
+    return 2.5
+
+
+def _maybe_trip_rate_limit(circuit_id: str, exc: Exception) -> None:
+    if not circuit_id:
         return
     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
-        if trace_id not in _RATE_LIMIT_TRIPPED:
-            logger.warning("llm_rate_limit_circuit_open trace_id=%s", trace_id)
-        _RATE_LIMIT_TRIPPED.add(trace_id)
+        if circuit_id not in _RATE_LIMIT_TRIPPED:
+            logger.warning("llm_rate_limit_circuit_open circuit_id=%s", circuit_id)
+        _RATE_LIMIT_TRIPPED.add(circuit_id)
 
 
 def _http_error_detail(exc: Exception) -> str:
@@ -112,29 +149,33 @@ class LLMClient:
         system_prompt: str,
         user_prompt: str,
         trace_id: str,
+        scope: str = "default",
+        model: str | None = None,
     ) -> dict[str, Any] | None:
         if not self.is_configured():
             return None
-        if _rate_limit_tripped(trace_id):
+        circuit_id = _circuit_key(trace_id, scope)
+        if _rate_limit_tripped(circuit_id):
             return None
-        if _json_circuit_open(trace_id):
-            logger.warning("llm_json_circuit_open trace_id=%s", trace_id)
+        if _json_circuit_open(circuit_id):
+            logger.warning("llm_json_circuit_open circuit_id=%s", circuit_id)
             return None
         for attempt in range(2):
             use_json_format = attempt == 0
             raw = self._complete(
                 system_prompt,
                 user_prompt,
-                trace_id,
+                circuit_id,
                 attempt,
                 json_format=use_json_format,
+                model=model,
             )
             parsed = self._parse_json_object(raw)
             if parsed is not None:
                 return parsed
             logger.warning(
-                "llm_invalid_json trace_id=%s attempt=%s json_format=%s",
-                trace_id,
+                "llm_invalid_json circuit_id=%s attempt=%s json_format=%s",
+                circuit_id,
                 attempt + 1,
                 use_json_format,
             )
@@ -196,10 +237,11 @@ class LLMClient:
         self,
         system_prompt: str,
         user_prompt: str,
-        trace_id: str,
+        circuit_id: str,
         attempt: int,
         *,
         json_format: bool = True,
+        model: str | None = None,
     ) -> str | None:
         url = f"{self.base}/chat/completions"
         headers = {
@@ -211,8 +253,9 @@ class LLMClient:
             extra = (
                 "\nReturn a single JSON object only. No markdown. No explanation."
             )
+        mdl = (model or "").strip() or self.model
         body: dict[str, Any] = {
-            "model": self.model,
+            "model": mdl,
             "messages": [
                 {"role": "system", "content": system_prompt + extra},
                 {"role": "user", "content": user_prompt},
@@ -221,28 +264,44 @@ class LLMClient:
         }
         if json_format:
             body["response_format"] = {"type": "json_object"}
-        try:
-            with httpx.Client(timeout=self.timeout) as client:
-                r = client.post(url, headers=headers, json=body)
-                r.raise_for_status()
-                data = r.json()
-            return (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
-        except Exception as exc:
-            _maybe_trip_rate_limit(trace_id, exc)
-            if json_format:
-                _record_json_http_failure(trace_id)
-            logger.warning(
-                "llm_http_error trace_id=%s err=%s json_format=%s",
-                trace_id,
-                _http_error_detail(exc),
-                json_format,
-            )
-            return None
+        for rate_attempt in range(2):
+            try:
+                with httpx.Client(timeout=self.timeout) as client:
+                    r = client.post(url, headers=headers, json=body)
+                    r.raise_for_status()
+                    data = r.json()
+                return (
+                    data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                )
+            except Exception as exc:
+                if (
+                    rate_attempt == 0
+                    and isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code == 429
+                ):
+                    wait = _retry_after_seconds(exc)
+                    if wait is not None:
+                        logger.info(
+                            "llm_rate_limit_retry circuit_id=%s wait_s=%.1f",
+                            circuit_id,
+                            wait,
+                        )
+                        time.sleep(wait)
+                        continue
+                _maybe_trip_rate_limit(circuit_id, exc)
+                if json_format:
+                    _record_json_http_failure(circuit_id)
+                logger.warning(
+                    "llm_http_error circuit_id=%s err=%s json_format=%s",
+                    circuit_id,
+                    _http_error_detail(exc),
+                    json_format,
+                )
+                return None
+        return None
 
     def embed_texts(
         self,

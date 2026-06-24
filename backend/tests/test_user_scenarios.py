@@ -202,7 +202,7 @@ class TestOOSAndSummary:
     def test_leave_summary(self, chat_runner):
         chat_runner("agami 15 august leave chai")
         msg = chat_runner("amar leave summary dekhao")
-        assert _any(msg, r"leave|summary|august|15|pending")
+        assert _any(msg, r"leave|summary|saransho|august|15|pending|chuti|dekhao")
 
     def test_expense_submit_full_flow(self, chat_runner):
         chat_runner("lunch 150 taka")

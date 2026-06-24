@@ -1,17 +1,25 @@
-import re
+"""Deprecated shim — use chat.services.reference_extractors (Phase 11)."""
+
+from __future__ import annotations
+
+import warnings
 from typing import Any
 
+from chat.services.reference_extractors import extract_reference_entities
 
-_REF_RE = re.compile(
-    r"\b(?:ref|reference|request\s*id|rid)\s*[:#-]?\s*([A-Za-z0-9-]+)\b",
-    re.I,
-)
-_BARE_REF_RE = re.compile(r"\b([A-Z]{2,}-\d{4,}[A-Z0-9-]*)\b")
+__all__ = ["EntityExtractor"]
 
 
 class EntityExtractor:
+    """Deprecated. Use extract_reference_entities() directly."""
+
     def extract_rules_only(self, message: str, *, intent: str = "") -> dict[str, Any]:
-        return self._extract_rules(message)
+        warnings.warn(
+            "EntityExtractor is deprecated; use reference_extractors.extract_reference_entities.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return extract_reference_entities(message)
 
     def extract(
         self,
@@ -20,23 +28,9 @@ class EntityExtractor:
         context_lines: list[str] | None,
         trace_id: str = "",
     ) -> dict[str, Any]:
-        entities = self._extract_rules(message)
-        return {"entities": entities, "source": "rules"}
-
-    def _extract_rules(self, message: str) -> dict[str, Any]:
-        raw = message or ""
-        low = raw.lower()
-        out: dict[str, Any] = {}
-
-        m = _REF_RE.search(raw) or _BARE_REF_RE.search(raw)
-        if m:
-            out["request_id"] = m.group(1)
-
-        topic_match = re.search(
-            r"\b(?:about|regarding|on|for)\s+(?:the\s+)?(.{3,80}?)(?:\?|$)",
-            low,
+        warnings.warn(
+            "EntityExtractor is deprecated; use reference_extractors.extract_reference_entities.",
+            DeprecationWarning,
+            stacklevel=2,
         )
-        if topic_match:
-            out["policy_topic"] = topic_match.group(1).strip(" .")
-
-        return out
+        return {"entities": extract_reference_entities(message), "source": "rules"}

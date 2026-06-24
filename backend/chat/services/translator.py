@@ -110,11 +110,11 @@ def detect_reply_language(message: str) -> str:
     return "en"
 
 
-# Short confirmations / wizard tokens — keep the session reply language.
 _WEAK_REPLY_RE = re.compile(
     r"^(?:"
     r"yes|no|yep|yeah|y|n|ok|okay|submit|summary|summery|clear|confirm|cancel|stop|done|"
-    r"thanks|thank\s*you|"
+    r"thanks|thank\s*you|skip|"
+    r"full\s*day|half\s*day|annual|sick|lwop|morning|afternoon|"
     r"হ্যাঁ|না|ঠিক|শেষ|জমা|সারাংশ|"
     r"ha|hae|han|na"
     r")(?:[.!?]*)$",
@@ -133,7 +133,11 @@ def is_weak_language_signal(message: str) -> bool:
     if len(text) <= 16 and not has_bengali_chars(text) and not has_banglish_words(text):
         words = re.findall(r"[a-zA-Z]+", text.lower())
         if words and len(words) <= 3 and all(
-            w in {"yes", "no", "yep", "yeah", "ok", "okay", "submit", "summary", "clear", "confirm", "cancel", "done", "thanks", "thank", "please"}
+            w in {
+                "yes", "no", "yep", "yeah", "ok", "okay", "submit", "summary", "clear",
+                "confirm", "cancel", "done", "thanks", "thank", "please", "skip",
+                "full", "day", "half", "annual", "sick", "lwop", "morning", "afternoon",
+            }
             for w in words
         ):
             return True
@@ -144,13 +148,22 @@ def resolve_reply_language(message: str, stored: str | None = None) -> str:
     """
     Pick reply language for this turn.
 
-    Explicit requests (``banglai bolo``, ``in english``) win. Ambiguous tokens
-    such as ``yes`` / ``submit`` / ``summary`` keep ``stored`` when set.
+    Explicit requests (``banglai bolo``, ``in english``) win. Once a session
+    language is established (``stored``), keep it across workflow turns unless
+    the user clearly switches (Bengali script, explicit request, or stronger
+    Banglish signal on an English session).
     """
     explicit = detect_explicit_reply_language(message)
     if explicit:
         return explicit
-    if stored and is_weak_language_signal(message):
+    if stored:
+        if is_weak_language_signal(message):
+            return stored
+        detected = detect_reply_language(message)
+        if detected == "bn":
+            return "bn"
+        if detected == "banglish" and stored == "en":
+            return "banglish"
         return stored
     return detect_reply_language(message)
 

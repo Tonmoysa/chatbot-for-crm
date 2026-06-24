@@ -6,7 +6,7 @@ from chat.models import ConversationSession, ConversationTurn
 
 
 class ConversationMemoryStore:
-    """Session-scoped history for multi-turn context (database-backed)."""
+    """Low-level transcript persistence — use ``SessionStore`` in production."""
 
     def __init__(self, max_turns: int = 30) -> None:
         self.max_turns = max_turns
@@ -46,18 +46,29 @@ class ConversationMemoryStore:
         return lines
 
     def append(self, session: ConversationSession, role: str, content: str) -> None:
+        """Append one transcript line (deprecated debug paths only)."""
         ConversationTurn.objects.create(session=session, role=role, content=content)
         self._trim(session)
-        if role == ConversationTurn.ROLE_USER:
-            self._bump_turn_count(session)
 
-    @staticmethod
-    def _bump_turn_count(session: ConversationSession) -> None:
-        from chat.services.session_memory import load_session_memory, save_session_memory
-
-        memory = load_session_memory(session)
-        memory.turn_count += 1
-        save_session_memory(session, memory)
+    def append_transcript_turn(
+        self,
+        session: ConversationSession,
+        *,
+        user_message: str,
+        assistant_message: str,
+    ) -> None:
+        """Append user + assistant lines for one completed turn."""
+        ConversationTurn.objects.create(
+            session=session,
+            role=ConversationTurn.ROLE_USER,
+            content=user_message,
+        )
+        ConversationTurn.objects.create(
+            session=session,
+            role=ConversationTurn.ROLE_ASSISTANT,
+            content=assistant_message,
+        )
+        self._trim(session)
 
     def _trim(self, session: ConversationSession) -> None:
         ids = list(

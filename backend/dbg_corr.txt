@@ -1,6 +1,0 @@
-﻿exp_corr True
-susp_leave False
-leave_rev True
-exp_corr False
-susp_leave True
-leave_rev True

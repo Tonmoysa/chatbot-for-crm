@@ -87,15 +87,22 @@ curl -s "http://127.0.0.1:8000/api/mock/leave-balance/?employee_id=E001" -H "X-A
 
 ## Architecture (layers)
 
-1. **API (DRF)** — `chat/views.py`, `chat/serializers.py`
-2. **Orchestrator** — `chat/services/orchestrator.py`
-3. **Intent** — `chat/services/intent_detector.py` (+ rules)
-4. **Entity extraction** — `chat/services/entity_extractor.py` (+ rules)
-5. **Decision engine** — `chat/services/decision_engine.py` (rules only)
-6. **CRM adapters** — `chat/services/crm/` (`MockCRMAdapter`, `RealCRMAdapter`)
-7. **Conversation memory** — `chat/services/memory_store.py` + `chat/models.py`
-8. **Response formatting** — `chat/services/response_formatter.py`
-9. **Observability** — `TraceIdMiddleware`, structured logs under logger `hr_chatbot`
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the Phase 1–10 pipeline.
+
+Production path: `POST /api/chat/` only.
+
+| Layer | Module |
+|-------|--------|
+| API | `chat/views.py` |
+| Orchestrator | `chat/services/orchestrator.py` |
+| Understanding | `chat/services/platform/ai_understanding.py` |
+| Decision Core | `chat/services/pending_question_engine.py` |
+| Plan + executor | `chat/services/platform/pipeline.py` |
+| State + memory | `chat/services/session_memory.py`, `session_store.py` |
+| Response | `chat/services/platform/response_composer.py` |
+| CRM | `chat/services/crm/` |
+
+Deprecated debug routes (`/api/intent/`, `/extract/`, `/decision/`) default off — use `ENABLE_LEGACY_DEBUG_ENDPOINTS=true` only for local debugging.
 
 ## Endpoints
 

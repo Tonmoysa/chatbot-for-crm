@@ -90,6 +90,31 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # --- HR microservice configuration ---
 HR_SERVICE_API_KEY = os.environ.get("HR_SERVICE_API_KEY", "")
 USE_MOCK_CRM = os.environ.get("USE_MOCK", "true").lower() in ("1", "true", "yes")
+USE_TURN_CONTEXT = os.environ.get("USE_TURN_CONTEXT", "true").lower() in ("1", "true", "yes")
+USE_DECISION_CORE = True
+USE_LEAVE_PLAN = os.environ.get("USE_LEAVE_PLAN", "true").lower() in ("1", "true", "yes")
+# Phase 10 — architecture cleanup complete; legacy orchestrator path removed (no effect).
+ENABLE_LEGACY_PATH = False
+# Deprecated debug endpoints (intent/extract/decision); production uses POST /chat/ only.
+ENABLE_LEGACY_DEBUG_ENDPOINTS = os.environ.get("ENABLE_LEGACY_DEBUG_ENDPOINTS", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# Phase 8 — expense plan executor + platform-only routing for expense turns.
+EXPENSE_NEW_ARCH = os.environ.get("EXPENSE_NEW_ARCH", "true").lower() in ("1", "true", "yes")
+# Phase 4 — informational turns via PlanBuilder (policy, status, OOS, greeting).
+USE_INFORMATIONAL_PLAN = os.environ.get("USE_INFORMATIONAL_PLAN", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# Phase 10 — consolidated turn_complete log (context → understanding → decision → plan → state → response).
+FULL_TURN_OBSERVABILITY = os.environ.get("FULL_TURN_OBSERVABILITY", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 PHP_CRM_BASE_URL = os.environ.get("PHP_CRM_BASE_URL", "").rstrip("/")
 PHP_CRM_API_KEY = os.environ.get("PHP_CRM_API_KEY", "")
@@ -100,6 +125,8 @@ CRM_HTTP_MAX_RETRIES = int(os.environ.get("CRM_HTTP_MAX_RETRIES", "2"))
 LLM_API_BASE_URL = os.environ.get("LLM_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+# Optional dedicated model for expense draft interpreter (smaller / faster on Groq).
+LLM_EXPENSE_MODEL = os.environ.get("LLM_EXPENSE_MODEL", "").strip() or LLM_MODEL
 LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "25"))
 LLM_MESSAGE_POLISH = os.environ.get("LLM_MESSAGE_POLISH", "true").lower() in (
     "1",

@@ -22,19 +22,43 @@ from chat.serializers import (
 from chat.services.session_history import get_session_messages, list_sessions
 from chat.identity import identity_from_request, identity_from_validated_data
 from chat.services.crm.factory import get_crm_adapter
-from chat.services.decision_engine import DecisionEngine
-from chat.services.entity_extractor import EntityExtractor
-from chat.services.intent_detector import IntentDetector
+from chat.services.document_reader import extract_text_from_upload
 from chat.services.llm_client import LLMClient
 from chat.services.memory_store import ConversationMemoryStore
 from chat.services.observability import log_step
 from chat.services.orchestrator import ChatOrchestrator
-from chat.services.document_reader import extract_text_from_upload
+from django.conf import settings
 from knowledge_base.services.qdrant_service import collection_name, get_qdrant_client
 
 
 def _trace(request) -> str:
     return getattr(request, "trace_id", None) or str(uuid.uuid4())
+
+
+def _legacy_debug_disabled_response(tid: str, endpoint: str) -> Response:
+    """Phase 11 — deprecated debug endpoints."""
+    return Response(
+        {
+            "trace_id": tid,
+            "intent": "",
+            "entities": {},
+            "decision": {"outcome": "DEPRECATED", "reason": f"{endpoint} removed in Phase 11."},
+            "response": {
+                "message": (
+                    f"The `{endpoint}` debug endpoint is deprecated. "
+                    "Use POST /chat/ for the full Decision Core pipeline."
+                ),
+                "status": "deprecated",
+                "request_id": "",
+            },
+            "status": "deprecated",
+        },
+        status=status.HTTP_410_GONE,
+    )
+
+
+def _legacy_debug_enabled() -> bool:
+    return getattr(settings, "ENABLE_LEGACY_DEBUG_ENDPOINTS", False)
 
 
 @extend_schema(
@@ -254,10 +278,11 @@ class DocumentExtractView(APIView):
 
 
 @extend_schema(
-    summary="Intent detection only",
-    tags=["Chat"],
+    summary="[Deprecated] Intent detection only",
+    tags=["Chat (deprecated)"],
     request=IntentRequestSerializer,
-    responses={200: HrEnvelopeSerializer},
+    responses={410: HrEnvelopeSerializer, 200: HrEnvelopeSerializer},
+    deprecated=True,
 )
 class IntentView(APIView):
     permission_classes = [IsAuthenticated]
@@ -267,17 +292,21 @@ class IntentView(APIView):
         ser.is_valid(raise_exception=True)
         identity_from_validated_data(ser.validated_data)
         tid = _trace(request)
+        if not _legacy_debug_enabled():
+            return _legacy_debug_disabled_response(tid, "intent")
+        from chat.services.intent_detector import IntentDetector
+
         det = IntentDetector()
         r = det.detect(ser.validated_data["message"], tid)
-        log_step(tid, "intent_only", {"intent": r.get("intent")})
+        log_step(tid, "intent_only", {"intent": r.get("intent"), "deprecated": True})
         return Response(
             {
                 "trace_id": tid,
                 "intent": r.get("intent", ""),
                 "entities": {"confidence": r.get("confidence"), "source": r.get("source")},
-                "decision": {},
+                "decision": {"outcome": "DEPRECATED"},
                 "response": {
-                    "message": "Intent detection complete.",
+                    "message": "Intent detection complete (deprecated endpoint).",
                     "status": "success",
                     "request_id": "",
                 },
@@ -287,10 +316,11 @@ class IntentView(APIView):
 
 
 @extend_schema(
-    summary="Entity extraction only",
-    tags=["Chat"],
+    summary="[Deprecated] Entity extraction only",
+    tags=["Chat (deprecated)"],
     request=ExtractRequestSerializer,
-    responses={200: HrEnvelopeSerializer},
+    responses={410: HrEnvelopeSerializer, 200: HrEnvelopeSerializer},
+    deprecated=True,
 )
 class ExtractView(APIView):
     permission_classes = [IsAuthenticated]
@@ -300,6 +330,10 @@ class ExtractView(APIView):
         ser.is_valid(raise_exception=True)
         identity = identity_from_validated_data(ser.validated_data)
         tid = _trace(request)
+        if not _legacy_debug_enabled():
+            return _legacy_debug_disabled_response(tid, "extract")
+        from chat.services.entity_extractor import EntityExtractor
+
         mem = ConversationMemoryStore()
         session = mem.get_or_create_session(
             company_id=identity.company_id,
@@ -314,15 +348,15 @@ class ExtractView(APIView):
             ctx,
             tid,
         )
-        log_step(tid, "extract_only", {})
+        log_step(tid, "extract_only", {"deprecated": True})
         return Response(
             {
                 "trace_id": tid,
                 "intent": ser.validated_data["intent"],
                 "entities": r.get("entities") or {},
-                "decision": {"source": r.get("source")},
+                "decision": {"source": r.get("source"), "outcome": "DEPRECATED"},
                 "response": {
-                    "message": "Entity extraction complete.",
+                    "message": "Entity extraction complete (deprecated endpoint).",
                     "status": "success",
                     "request_id": "",
                 },
@@ -332,10 +366,11 @@ class ExtractView(APIView):
 
 
 @extend_schema(
-    summary="Decision engine only",
-    tags=["Chat"],
+    summary="[Deprecated] Decision engine only",
+    tags=["Chat (deprecated)"],
     request=DecisionRequestSerializer,
-    responses={200: HrEnvelopeSerializer},
+    responses={410: HrEnvelopeSerializer, 200: HrEnvelopeSerializer},
+    deprecated=True,
 )
 class DecisionView(APIView):
     permission_classes = [IsAuthenticated]
@@ -343,9 +378,12 @@ class DecisionView(APIView):
     def post(self, request):
         ser = DecisionRequestSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        identity = identity_from_validated_data(ser.validated_data)
+        identity_from_validated_data(ser.validated_data)
         tid = _trace(request)
-        crm = get_crm_adapter()
+        if not _legacy_debug_enabled():
+            return _legacy_debug_disabled_response(tid, "decision")
+        from chat.services.decision_engine import DecisionEngine
+
         crm_context: dict = {}
         intent = ser.validated_data["intent"]
         entities = ser.validated_data["entities"]
@@ -353,7 +391,7 @@ class DecisionView(APIView):
         decision = eng.evaluate(
             intent=intent, entities=entities, crm_context=crm_context
         )
-        log_step(tid, "decision_only", {"outcome": decision.get("outcome")})
+        log_step(tid, "decision_only", {"outcome": decision.get("outcome"), "deprecated": True})
         return Response(
             {
                 "trace_id": tid,
@@ -361,7 +399,7 @@ class DecisionView(APIView):
                 "entities": entities,
                 "decision": decision,
                 "response": {
-                    "message": "Decision evaluation complete.",
+                    "message": "Decision evaluation complete (deprecated endpoint).",
                     "status": "success",
                     "request_id": "",
                 },

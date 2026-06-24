@@ -1,0 +1,150 @@
+# Phase 9 — live transcript regression scenarios
+scenarios:
+  - id: expense_during_leave_asks_switch
+    description: Expense while leave wizard open must not corrupt leave slots
+    turns:
+      - user: "Actually my mama has been sick for a long time, need treatment in Dhaka. I cannot attend office from Monday (14th July) to Wednesday (16th July)."
+      - user: "annual"
+      - user: "amar ajke expense hoyeche 100 taka for bus then lunch 50 taka bike 120 taka snack 30 taka"
+        expect_any: ["expense|unfinished|leave|continue|detected|claim|switch"]
+        expect_none: ["day scope|day_scope|saved leave type"]
+
+  - id: oos_pauses_leave_draft
+    turns:
+      - user: "Actually my mama has been sick for a long time, need treatment in Dhaka. I cannot attend office from Monday (14th July) to Wednesday (16th July)."
+      - user: "annual"
+      - user: "what is python?"
+        expect_all: ["scope|outside|hr|can't help|বাইরে", "paused|pause|continue|leave"]
+
+  - id: policy_during_expense
+    turns:
+      - user: "bus 100 taka"
+      - user: "sick leave policy ki?"
+        expect_any: ["policy|rules|handbook|uploaded|couldn't find|reimbursement"]
+
+  - id: greeting_hi
+    turns:
+      - user: "hi"
+        expect_any: ["here|attendance|wfh|rules|need|hello|help|হ্যালো|সাহায্য"]
+
+  - id: leave_transcript_end_date_reason_safe
+    description: Transcript bug — end date modify must not corrupt reason during submit review
+    turns:
+      - user: "14 july theke 18 july annual leave"
+      - user: "family program"
+      - user: "end date 20 july hobe"
+        expect_any: ["20|july|review|submit|family|end"]
+        state_after:
+          active_workflow_id: leave
+          draft_fields:
+            reason: "family program"
+            end_date: "2026-07-20"
+
+  - id: leave_transcript_back_koro_reason_safe
+    description: Transcript bug — back/modify preamble must not overwrite reason
+    turns:
+      - user: "agami 22 august annual leave chai"
+      - user: "full day"
+      - user: "family program"
+      - user: "leave e back koro..ami kichu besoy modify korbo"
+        expect_any: ["review|submit|modify|22|august|family"]
+        state_after:
+          draft_fields:
+            reason: "family program"
+
+  - id: leave_transcript_submit_no_no_loop
+    description: Transcript bug — no at submit must return review, not yes-to-submit loop
+    turns:
+      - user: "agami 22 august annual leave chai"
+      - user: "full day"
+      - user: "family program"
+      - user: "no"
+        expect_any: ["22|august|family|annual|submit|modify"]
+        expect_none: ["yes to submit"]
+        state_after:
+          pending_confirmation: null
+
+  - id: leave_transcript_long_narrative_start
+    description: Transcript — long Banglish narrative should start leave with dates
+    turns:
+      - user: "Actually last kichudin dhore family related kichu urgent issue cholche. Amar mama onekdin dhore osustho chilen, ekhon take Dhaka te niye treatment korate hobe ebong family member hisebe amar uposthit thaka khub dorkar. Ei karone ami Monday (14th July) theke Wednesday (16th July) porjonto office e attend korte parbo na."
+        expect_any: ["annual|sick|lwop|type|leave type|14|july|16|ছুটি"]
+        state_after:
+          active_workflow_id: leave
+          draft_field_present: [start_date, end_date]
+
+  - id: leave_transcript_parallel_block_then_summary
+    description: Phase 1/3 — active leave block then user asks for summary (not reason loop)
+    turns:
+      - user: "5 August 2026 theke 9 August 2026 annual leave chai. family program."
+      - user: "Hi, amar ekta leave apply korte hobe boner biye. 5 August 2026 theke 9 August 2026 casual leave."
+        expect_any: ["active leave|already have|complete|cancel|summary|review"]
+      - user: "leave er summery ta daw"
+        expect_any: ["summary|summery|review|august|annual|leave"]
+        expect_none: ["clear leave reason", "not a change command", "chuti nite chan"]
+
+  - id: leave_transcript_meta_complaint_not_restart
+    description: Phase 2/3 — Bangla complaint must not offer new leave start
+    turns:
+      - user: "5 August 2026 theke 9 August 2026 annual leave chai"
+      - user: "osusto"
+      - user: "no"
+      - user: "reason keno modify korcho"
+        expect_any: ["draft|summary|reason|osustho|august|modify|change|leave"]
+        expect_none: ["chuti nite chan", "leave request shuru korbo", "submit a leave request"]
+
+  - id: leave_transcript_where_is_leave
+    description: Phase 1 — where is my leave during pending reason
+    turns:
+      - user: "5 August 2026 theke 9 August 2026 annual leave chai"
+      - user: "where is my leave?"
+        expect_any: ["summary|review|august|annual|leave|status"]
+        expect_none: ["clear leave reason"]
+
+  - id: leave_transcript_osusto_compound_start
+    description: Phase 4 — sick + leave in one line should not re-ask type only
+    turns:
+      - user: "ami onek osusto tai amar leave lagbe"
+        expect_any: ["sick|osustho|start|shuru|tarikh|date|kokhon"]
+        expect_none: ["chutir dhoron proyojon", "annual, sick"]
+
+  - id: leave_transcript_kalke_start_date
+    description: Phase 4 — kalke answers pending start_date
+    turns:
+      - user: "ami onek osusto tai amar leave lagbe"
+      - user: "sick"
+      - user: "kalke"
+        expect_any: ["june|july|august|september|october|saved|shuru|start|reason|karon|review|summary"]
+        expect_none: ["Do you want the leave summary, or are you answering"]
+
+  - id: leave_transcript_yes_submits_review
+    description: Phase 4 — yes at review must submit not restart leave
+    turns:
+      - user: "5 August 2026 theke 9 August 2026 annual leave chai"
+      - user: "family wedding"
+      - user: "skip"
+      - user: "summary"
+      - user: "yes"
+        expect_any: ["submitted|reference|MOCK|joma|submit"]
+        expect_none: ["Would you like to submit a leave request", "chuti nite chan"]
+
+  - id: leave_transcript_ar_ki_lagbe_not_reason
+    description: Phase 4 — process question must not become reason text
+    turns:
+      - user: "5 August 2026 theke 9 August 2026 annual leave chai"
+      - user: "family wedding"
+      - user: "skip"
+      - user: "ar ki lagbe"
+        expect_any: ["draft|summary|submit|yes|change|august|leave"]
+        expect_none: ["karon: ar ki lagbe", "reason.*ar ki lagbe"]
+
+  - id: leave_transcript_new_leave_after_submit
+    description: Phase 4 — wedding narrative after submit starts new leave
+    turns:
+      - user: "5 August 2026 theke 9 August 2026 annual leave chai"
+      - user: "family wedding"
+      - user: "skip"
+      - user: "yes"
+      - user: "Hi, amar ekta leave apply korte hobe. Amar choto boner biye fix hoyeche. Ei karone ami 5 August 2026 theke 9 August 2026 porjonto office e attend korte parbo na. Mot 5 diner leave lagbe. Eta Casual Leave hisebe apply korte chai. Please amar leave request ta prepare kore review dekhao."
+        expect_any: ["august|annual|wedding|bon|start|shuru|leave"]
+        expect_none: ["ar ki lagbe", "Status: Joma"]

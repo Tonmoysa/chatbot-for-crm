@@ -1,0 +1,27 @@
+# Phase 0 — expense conversation regression lock (rules path; LLM scenarios in unit tests)
+scenarios:
+  - id: expense_route_pending_asks_route
+    description: Bus without route should ask for route, not add duplicate items
+    turns:
+      - user: "bus 120 taka lunch 280 taka"
+        expect_any: ["route|from|to|travel|Bus|120"]
+
+  - id: expense_compound_stays_collecting
+    description: Multi-item expense stays in expense workflow
+    turns:
+      - user: "Aj office jawar somoy bus e 120 taka lagse. Dupure lunch korlam 280 taka."
+        expect_any: ["bus|lunch|120|280|route|expense|খরচ|Total"]
+        state_after:
+          active_workflow_id: expense
+
+  - id: expense_review_add_unified
+    description: Review stage add uses same draft editor (not separate review LLM)
+    turns:
+      - user: "lunch 280 taka bus 120 taka"
+        expect_any: ["route|bus|lunch|280|120"]
+      - user: "submit koro"
+        expect_any: ["confirm|submit|review|280|120"]
+      - user: "bus 90 taka add koro"
+        expect_any: ["90|bus|add|review|confirm"]
+        state_after:
+          active_workflow_id: expense

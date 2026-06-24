@@ -36,6 +36,30 @@ _TO_RE = re.compile(
 
 
 
+_ROUTE_STOPWORDS = frozenset(
+    {
+        "hobe", "habe", "route", "expense", "er", "theke", "from", "to",
+        "koro", "kor", "dao", "de", "den", "hoye", "hoy", "no", "number",
+        "nombor", "numer",
+    }
+)
+
+
+def _pick_place_to_place_route(raw: str) -> tuple[str, str] | None:
+    """Prefer the last clean ``Place to Place`` pair, skipping Banglish filler words."""
+    best: tuple[str, str] | None = None
+    for m in re.finditer(
+        r"\b([A-Za-z\u0980-\u09FF]+)\s+to\s+([A-Za-z\u0980-\u09FF]+)\b",
+        raw,
+        re.I,
+    ):
+        frm, to = m.group(1).strip().lower(), m.group(2).strip().lower()
+        if frm in _ROUTE_STOPWORDS or to in _ROUTE_STOPWORDS:
+            continue
+        best = (m.group(1).strip().title(), m.group(2).strip().title())
+    return best
+
+
 def parse_route(message: str) -> tuple[str, str] | None:
 
     raw = (message or "").strip()
@@ -52,7 +76,9 @@ def parse_route(message: str) -> tuple[str, str] | None:
 
         return m.group(1).strip().title(), m.group(2).strip().title()
 
-
+    picked = _pick_place_to_place_route(raw)
+    if picked:
+        return picked
 
     m = _ROUTE_RE.search(raw)
 

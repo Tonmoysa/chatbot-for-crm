@@ -1,4 +1,5 @@
 import re
+import warnings
 from typing import Any
 
 from chat.constants import (
@@ -70,7 +71,14 @@ def _looks_like_escalation(message: str) -> bool:
 
 
 class IntentDetector:
+    """Deprecated — Phase 11. Routing uses Decision Core + AI Understanding."""
+
     def detect(self, message: str, trace_id: str = "") -> dict[str, Any]:
+        warnings.warn(
+            "IntentDetector is deprecated; chat uses Decision Core instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         raw = (message or "").strip()
         if not raw:
             return {"intent": INTENT_UNKNOWN, "confidence": 0.0, "source": "rules"}

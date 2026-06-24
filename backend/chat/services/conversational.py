@@ -14,9 +14,20 @@ rule match, etc.) and persists the result through the normal response envelope.
 from __future__ import annotations
 
 import random
+import re
 
 from chat.services.llm_client import LLMClient
 from chat.services.translator import detect_user_language
+
+_FAKE_WORKFLOW_SUCCESS_RE = re.compile(
+    r"(?:"
+    r"প্রস্তুত\s*কর|request\s+prepared|request\s+ready|already\s+submitted|"
+    r"shared\s+with\s+(?:your\s+)?team|টিম\s*লিড|শেয়ার\s*কর|"
+    r"submit\s+(?:কর|করে|হয়ে)|জমা\s*(?:দিয়|হয়ে)|"
+    r"i(?:'ll|'ll|\s+will)\s+(?:share|submit|send)"
+    r")",
+    re.I | re.UNICODE,
+)
 
 
 _FALLBACK_SYSTEM = """You are a warm, human-sounding HR assistant for a real estate company. You are chatting with an employee right now. The current message did NOT match any specific company rule, intent, or workflow — so you are in free-form reply mode.
@@ -44,6 +55,7 @@ UNCLEAR HR-ISH QUESTIONS
 
 HARD RULES (NEVER VIOLATE)
 - NEVER write: "I don't understand", "I can't understand your question", "no rule found", "system error", "as an AI", "I'm just a bot", "প্রশ্ন বোঝা যায় না", "বুঝতে পারলাম না". Just respond naturally, the way a person would.
+- NEVER claim a leave/expense request is prepared, submitted, shared with a team lead, or sent to HR — you are NOT in workflow mode on this turn. If they want leave or expense, ask them to say so and you will collect details step by step.
 - NEVER invent specific numbers, salaries, dates, or exact policy text.
 - NEVER answer when a national/religious holiday **falls** (e.g. "eid kobe", "26 march ki dibosh", "durga puja kobe") or ask when they want to "celebrate" — those are out of scope; say you only help with company HR (attendance, uploaded policies, WFH).
 - NEVER use "বিকাল" or "bikel" for job Termination (termination) — that means evening. Use চাকরি সমাপ্তি or Termination.
@@ -108,6 +120,20 @@ def _static_fallback(user_lang: str) -> str:
     return random.choice(pool)
 
 
+def _sanitize_fake_workflow_claims(text: str, *, user_lang: str) -> str:
+    if not text or not _FAKE_WORKFLOW_SUCCESS_RE.search(text):
+        return text
+    if user_lang == "bn":
+        return (
+            "আমি এখনও আপনার leave/expense request workflow-এ নিই — "
+            "চাইলে leave বা expense শুরু করতে বলুন, আমি ধাপে ধাপে সাজিয়ে দেব।"
+        )
+    return (
+        "I haven't started a leave/expense workflow yet — "
+        "say if you'd like to begin a leave or expense request and I'll walk you through it."
+    )
+
+
 def conversational_reply(
     *,
     message: str,
@@ -156,4 +182,5 @@ def conversational_reply(
         user_prompt=user_prompt,
         trace_id=trace_id,
     )
-    return out or _static_fallback(user_lang)
+    reply = out or _static_fallback(user_lang)
+    return _sanitize_fake_workflow_claims(reply, user_lang=user_lang)

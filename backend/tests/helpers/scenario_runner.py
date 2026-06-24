@@ -2,22 +2,16 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import pytest
 
 from chat.services.orchestrator import ChatOrchestrator
+from tests.helpers.yaml_scenario_runner import llm_disabled
 
 
 @pytest.fixture
 def chat_runner(db):
     """Orchestrator with LLM disabled (rules-only)."""
-    with patch("chat.services.pending_question_engine.LLMClient") as pq_llm, patch(
-        "chat.services.platform.ai_understanding.LLMClient"
-    ) as ai_llm, patch("chat.services.conversational.LLMClient") as conv_llm:
-        pq_llm.return_value.is_configured.return_value = False
-        ai_llm.return_value.is_configured.return_value = False
-        conv_llm.return_value.is_configured.return_value = False
+    with llm_disabled():
         orch = ChatOrchestrator()
         state = {"session_id": ""}
 

@@ -1,0 +1,375 @@
+# Phase A — leave workflow spec scenarios (TDD blueprint for Phases B–F)
+scenarios:
+  - id: leave_start_collects_remaining
+    turns:
+      - user: "agami 15 august leave chai"
+        expect_any: ["leave|august|15|type|annual|sick|lwop|day|scope|ছুটি"]
+        state_after:
+          active_workflow_id: leave
+          draft_field_present: [start_date]
+
+  - id: leave_type_unclear_shows_three_options
+    turns:
+      - user: "agami 20 september leave chai"
+        expect_all: ["annual", "sick", "lwop"]
+        state_after:
+          active_workflow_id: leave
+          pending_question_field: leave_type
+          draft_field_absent: [leave_type]
+
+  - id: leave_half_day_asks_period
+    turns:
+      - user: "kal half day sick leave chai"
+        expect_any: ["morning|afternoon|half|অর্ধ|সকাল|বিকেল"]
+        state_after:
+          active_workflow_id: leave
+          draft_fields:
+            day_scope: half_day
+            leave_type: sick
+          draft_field_present: [start_date]
+          pending_question_field: half_day_period
+      - user: "morning"
+        expect_any: ["reason|optional|karon|কারণ|share|skip|review|submit|porjalochona|ha"]
+        state_after:
+          draft_fields:
+            half_day_period: morning
+
+  - id: leave_today_extracts_date
+    turns:
+      - user: "ajke sick leave chai"
+        expect_any: ["full day|half day|day scope|puro din|ordho din|diner dhoron"]
+        state_after:
+          active_workflow_id: leave
+          draft_fields:
+            leave_type: sick
+          draft_field_present: [start_date]
+          pending_question_field: day_scope
+
+  - id: leave_tomorrow_extracts_type_and_date
+    turns:
+      - user: "tomorrow annual leave"
+        expect_any: ["full day|half day|day scope"]
+        state_after:
+          active_workflow_id: leave
+          draft_fields:
+            leave_type: annual
+          draft_field_present: [start_date]
+          pending_question_field: day_scope
+
+  - id: leave_multiday_auto_full_day_no_half_period
+    turns:
+      - user: "14 july theke 18 july annual leave"
+        expect_any: ["reason|optional|কারণ|share|skip"]
+        state_after:
+          active_workflow_id: leave
+          draft_fields:
+            leave_type: annual
+            day_scope: full_day
+          draft_field_present: [start_date, end_date]
+          pending_question_field: reason
+          pending_question_field_not: half_day_period
+
+  - id: leave_family_sick_no_auto_sick_on_start
+    turns:
+      - user: "mama osustho, agami theke 3 din leave lagbe"
+        expect_any: ["annual|sick|lwop|type|leave type"]
+        state_after:
+          active_workflow_id: leave
+          pending_question_field: leave_type
+          draft_field_absent: [leave_type]
+          draft_field_present: [reason]
+
+  - id: leave_family_sick_reject_sick_type
+    turns:
+      - user: "mama osustho, agami theke 3 din leave lagbe"
+      - user: "sick"
+        expect_any: ["reason|review|submit|annual|lwop|sick|medical|document"]
+        state_after:
+          draft_fields:
+            leave_type: sick
+
+  - id: leave_sick_3plus_doc_ask
+    turns:
+      - user: "ami osustho, 14 july theke 18 july porjonto sick leave"
+        expect_any: ["medical|document|optional|skip|3"]
+        state_after:
+          active_workflow_id: leave
+          pending_question_field: medical_document
+          draft_fields:
+            leave_type: sick
+            day_scope: full_day
+          draft_field_present: [start_date, end_date, reason]
+
+  - id: leave_sick_3plus_doc_skip_redirect
+    turns:
+      - user: "ami osustho, 14 july theke 18 july porjonto sick leave"
+      - user: "document nai"
+        expect_any: ["later|continue|sick|review|submit|skip|document"]
+        state_after:
+          draft_fields:
+            leave_type: sick
+          draft_field_present: [medical_document_skipped]
+
+  - id: leave_health_narrative_auto_sick
+    turns:
+      - user: "Hey, amar ekta leave apply korte hobe. Kichudin dhore amar health ta bhalo jacche na, doctor dekhanor por uni kichudin complete rest nite bolechen. Tai ami 18 August 2026 theke 21 August 2026 porjonto office e aste parbo na. Mot 4 diner leave lagbe. Eta Sick Leave hisebe apply korte chai. Doctor prescription ta ekhon amar sathe nai, kintu chaile pore upload korte parbo."
+        expect_any: ["sick|18|august|21|medical|optional|skip|review|full"]
+        state_after:
+          active_workflow_id: leave
+          draft_fields:
+            leave_type: sick
+          draft_field_present: [start_date, end_date, leave_type]
+
+  - id: leave_health_narrative_doc_skip_to_review
+    turns:
+      - user: "Hey, amar ekta leave apply korte hobe. Kichudin dhore amar health ta bhalo jacche na, doctor dekhanor por uni kichudin complete rest nite bolechen. Tai ami 18 August 2026 theke 21 August 2026 porjonto office e aste parbo na. Mot 4 diner leave lagbe. Eta Sick Leave hisebe apply korte chai."
+      - user: "amar kache document nai"
+        expect_any: ["later|continue|sick|review|submit|yes|august"]
+        state_after:
+          draft_fields:
+            leave_type: sick
+          draft_field_present: [medical_document_skipped]
+
+  - id: leave_reason_ask_then_skip
+    turns:
+      - user: "agami 10 august annual leave chai"
+      - user: "full day"
+        expect_any: ["reason|optional|কারণ|share|skip"]
+      - user: "skip"
+        expect_any: ["review|submit|yes|august"]
+
+  - id: block_second_leave_while_open
+    turns:
+      - user: "agami 15 august leave chai"
+      - user: "full day"
+      - user: "skip"
+      - user: "agami 20 august leave chai"
+        expect_any: ["already have an active leave|active leave request|complete or cancel|আগে"]
+
+  - id: leave_cancel_active_workflow
+    turns:
+      - user: "agami 15 august leave chai"
+      - user: "full day"
+      - user: "cancel my leave"
+        expect_any: ["cancelled|cancel|বাতিল"]
+        state_after:
+          active_workflow_id: null
+
+  - id: leave_submit_same_dates_blocked
+    company_id: co-leave-overlap
+    employee_id: emp-leave-overlap
+    seed_memory:
+      conversation_facts:
+        submitted_leave_ranges:
+          - start_date: "2026-08-10"
+            end_date: "2026-08-10"
+            request_id: "LV-SEED-1"
+    turns:
+      - user: "agami 10 august annual leave chai"
+        expect_any: ["already submitted|ইতিমধ্যে|different dates|অন্য তারিখ|LV-SEED"]
+
+  - id: leave_expense_interrupt_resume_intact
+    turns:
+      - user: "agami 15 august annual leave chai"
+      - user: "full day"
+        expect_any: ["reason|optional|কারণ|skip"]
+      - user: "skip"
+      - user: "bus e 200 taka laglo"
+        expect_any: ["expense|switch|leave|continue|unfinished"]
+      - user: "continue leave"
+        expect_all: ["15\\s+august|august\\s+15|2026-08-15", "annual|review|submit"]
+
+  - id: leave_switch_to_expense_then_resume_leave
+    turns:
+      - user: "agami 15 august annual leave chai"
+      - user: "full day"
+      - user: "skip"
+      - user: "bus e 200 taka laglo"
+      - user: "expense e jao"
+        expect_any: ["expense|200|route|category|travel|from|added"]
+      - user: "leave e jao"
+        expect_all: ["15\\s+august|august\\s+15|2026-08-15", "annual|review|submit|reason"]
+
+  - id: leave_review_formatted_dates
+    turns:
+      - user: "Actually my mama has been sick for a long time, need treatment in Dhaka. I cannot attend office from Monday (14th July) to Wednesday (16th July)."
+        expect_any: ["14|july|type|annual|sick|day|scope|leave|ছুটি"]
+      - user: "annual"
+      - user: "full day"
+      - user: "leave review dao"
+        expect_all: ["14\\s+july\\s+202\\d|202\\d-07-14", "16\\s+july|202\\d-07-16|end"]
+
+  - id: leave_explicit_sick_single_day_review
+    turns:
+      - user: "sick leave kal"
+      - user: "full day"
+        expect_any: ["reason|optional|কারণ|skip"]
+      - user: "skip"
+        expect_any: ["review|submit|sick|yes"]
+
+  - id: leave_long_narrative_starts_workflow
+    turns:
+      - user: >-
+          Hi, amar ekta leave apply korte hobe. Amar ma onek osustho, tai take hospital e niye jete hobe.
+          Ei karone ami 15 July 2026 theke 18 July 2026 porjonto office e aste parbo na.
+          Eta Annual Leave hisebe apply korte chai. Ekhon amar leave request ta prepare kore dao.
+        expect_any: ["leave|started|annual|july|15|18|day|scope|ছুটি"]
+        expect_none: ["প্রস্তুত করা হয়েছে|shared with your team|team lead"]
+        state_after:
+          active_workflow_id: leave
+          draft_field_present: [start_date, end_date, leave_type]
+
+  - id: leave_contextual_submit_after_start
+    turns:
+      - user: "agami 15 august annual leave chai"
+      - user: "full day"
+      - user: "skip"
+      - user: "okay ekhon submit koro"
+        expect_any: ["submit|yes|ha|review|august|15"]
+        state_after:
+          active_workflow_id: leave
+
+  - id: leave_summary_after_partial_draft
+    turns:
+      - user: "agami 15 august leave chai"
+      - user: "leave summery ta bolo"
+        expect_any: ["summary|summery|saransho|august|15|leave|pending|chuti|ছুটি|dekhao"]
+        state_after:
+          active_workflow_id: leave
+          draft_field_present: [start_date]
+
+  - id: leave_summary_report_keyword
+    turns:
+      - user: "agami 20 august annual leave chai"
+      - user: "full day"
+      - user: "skip"
+      - user: "leave er report dekhao"
+        expect_any: ["summary|summery|report|august|20|annual|pending|ছুটি"]
+        state_after:
+          active_workflow_id: leave
+
+  - id: leave_modify_reason_during_review
+    turns:
+      - user: "agami 22 august annual leave chai"
+      - user: "full day"
+      - user: "skip"
+      - user: "reason ta family program koro"
+        expect_any: ["family|review|submit|yes|22|august"]
+        state_after:
+          active_workflow_id: leave
+          draft_fields:
+            reason: "family program"
+
+  - id: leave_modify_date_during_review
+    turns:
+      - user: "agami 22 august annual leave chai"
+      - user: "full day"
+      - user: "family program"
+      - user: "date ta 23 august koro"
+        expect_any: ["23|august|review|submit|yes|family"]
+        state_after:
+          draft_fields:
+            start_date: "2026-08-23"
+            reason: "family program"
+
+  - id: leave_modify_type_during_review
+    turns:
+      - user: "agami 22 august annual leave chai"
+      - user: "full day"
+      - user: "skip"
+      - user: "leave type ta lwop koro"
+        expect_any: ["lwop|review|submit|yes|22|august"]
+        state_after:
+          draft_fields:
+            leave_type: "lwop"
+
+  - id: leave_submit_no_returns_review
+    turns:
+      - user: "agami 22 august annual leave chai"
+      - user: "full day"
+      - user: "family program"
+        expect_any: ["yes|submit|review|22|august|family"]
+      - user: "no"
+        expect_any: ["22|august|family|submit|modify|cancel"]
+        expect_none: ["yes to submit"]
+        state_after:
+          active_workflow_id: leave
+          pending_confirmation: null
+
+  - id: leave_submit_summary_full_body
+    turns:
+      - user: "agami 22 august annual leave chai"
+      - user: "full day"
+      - user: "family program"
+        expect_any: ["yes|submit|review|22|august"]
+      - user: "leave summery dekhao"
+        expect_any: ["22|august|family|annual|leave"]
+        expect_none: ["yes to submit"]
+
+  - id: leave_submit_cancel_abandons
+    turns:
+      - user: "agami 22 august annual leave chai"
+      - user: "full day"
+      - user: "family program"
+        expect_any: ["yes|submit|review"]
+      - user: "cancel"
+        expect_any: ["cancel"]
+        state_after:
+          active_workflow_id: null
+
+  - id: leave_post_cancel_summary
+    turns:
+      - user: "agami 22 august annual leave chai"
+      - user: "full day"
+      - user: "family program"
+      - user: "cancel"
+        expect_any: ["cancel"]
+      - user: "leave summery dekhao"
+        expect_any: ["active leave|no active|start|নতুন|draft"]
+        expect_none: ["before submitting", "yes to submit"]
+
+  - id: leave_modify_kar_ta_reason
+    turns:
+      - user: "agami 22 august annual leave chai"
+      - user: "full day"
+      - user: "skip"
+      - user: "kar ta family wedding koro"
+        expect_any: ["wedding|review|submit|yes|22|august"]
+        state_after:
+          draft_fields:
+            reason: "family wedding"
+
+  - id: leave_bare_date_koro_review
+    turns:
+      - user: "agami 22 august annual leave chai"
+      - user: "full day"
+      - user: "family program"
+      - user: "3 july koro"
+        expect_any: ["july|03|3|review|submit|family"]
+        state_after:
+          draft_fields:
+            start_date: "2026-07-03"
+            reason: "family program"
+
+  - id: leave_review_dekhao_during_submit
+    turns:
+      - user: "agami 22 august annual leave chai"
+      - user: "full day"
+      - user: "family program"
+        expect_any: ["yes|submit|review"]
+      - user: "review dekhao"
+        expect_any: ["22|august|family|annual"]
+        expect_none: ["yes to submit"]
+
+  - id: leave_banglish_sticky_prompts
+    description: Phase 5 — Banglish start then weak English token keeps localized prompts
+    turns:
+      - user: "agami 22 august annual leave chai"
+        expect_any: ["annual|august|22|chuti|leave|day|scope|dhoron|puro"]
+      - user: "full day"
+        expect_any: ["karon|reason|skip|optional|porjalochona|review|submit|dorkar"]
+        state_after:
+          active_workflow_id: leave
+          draft_fields:
+            day_scope: full_day
+

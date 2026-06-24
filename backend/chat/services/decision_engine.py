@@ -1,3 +1,8 @@
+"""Deprecated shim — use chat.services.informational_responses (Phase 11)."""
+
+from __future__ import annotations
+
+import warnings
 from typing import Any
 
 from chat.constants import (
@@ -8,10 +13,13 @@ from chat.constants import (
     INTENT_UNKNOWN,
     INTENT_WFH_REQUEST,
 )
+from chat.services.informational_responses import evaluate_request_status_decision
+
+__all__ = ["DecisionEngine"]
 
 
 class DecisionEngine:
-    """Rule-based source of truth for approval outcomes."""
+    """Deprecated. Status decisions use informational_responses; workflows use Decision Core."""
 
     def evaluate(
         self,
@@ -20,6 +28,11 @@ class DecisionEngine:
         entities: dict[str, Any],
         crm_context: dict[str, Any],
     ) -> dict[str, Any]:
+        warnings.warn(
+            "DecisionEngine is deprecated; use Decision Core + informational_responses.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         doc_text = str(entities.get("document_text") or "")
         if entities.get("document_read"):
             if not doc_text.strip():
@@ -47,18 +60,7 @@ class DecisionEngine:
             }
 
         if intent == INTENT_REQUEST_STATUS:
-            st = str((crm_context or {}).get("status") or "")
-            if st == "NOT_FOUND":
-                return {
-                    "outcome": "NEEDS_CLARIFICATION",
-                    "reason": "Request not found.",
-                    "rules_applied": ["REQUEST_STATUS_NOT_FOUND"],
-                }
-            return {
-                "outcome": "INFORMATIONAL",
-                "reason": "Request status lookup.",
-                "rules_applied": ["REQUEST_STATUS_LOOKUP"],
-            }
+            return evaluate_request_status_decision(entities=entities, crm_context=crm_context)
 
         if intent == INTENT_WFH_REQUEST:
             return {

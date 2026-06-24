@@ -1,0 +1,49 @@
+# Expense conversation scenarios (LLM-driven)
+scenarios:
+  - id: bus_add_asks_route
+    description: Banglish bus expense should ask route
+    turns:
+      - user: "ajke bus e 100 taka"
+        expect_any: ["route|from|to|কোথা|travel|first"]
+
+  - id: lunch_add_complete
+    turns:
+      - user: "lunch 150 taka"
+        expect_any: ["lunch|150|added|যোগ|submit|review"]
+
+  - id: amount_only_asks_category
+    turns:
+      - user: "100 taka expense hoyeche"
+        expect_any: ["type|category|lunch|snack|bus|খরচ"]
+
+  - id: route_only_asks_category
+    turns:
+      - user: "Mirpur to Motijheel 100 taka"
+        expect_any: ["bus|train|metro|rickshaw|category|type"]
+
+  - id: delete_asks_which_entry
+    turns:
+      - user: "bus 100 taka"
+      - user: "lunch 120 taka"
+      - user: "delete koro"
+        expect_any: ["which|delete|summary|entry|item|কোন|1\\.|2\\."]
+
+  - id: compound_expense_review
+    turns:
+      - user: "amar ajke expense hoyeche lunch 250 taka bus 100 taka snack 80 taka"
+      - user: "expense review dao"
+        expect_any: ["250|100|80|430|total|lunch|bus|snack|Pending"]
+
+  - id: expense_submit_missing_info
+    turns:
+      - user: "bus 100 taka"
+      - user: "submit expense"
+        expect_any: ["route|missing|from|to|কোথা"]
+
+  - id: resume_expense_phrase
+    turns:
+      - user: "lunch 200 taka"
+      - user: "leave chai kalke"
+        expect_any: ["leave|switch|unfinished|incomplete"]
+      - user: "expense e fire jao"
+        expect_any: ["expense|continu|lunch|200|pending"]

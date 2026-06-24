@@ -1,3 +1,0 @@
-route=('dhanmondi', 'banani গিয়েছি ১৮০ টাকা')
-cat='' amt=180.0 frm='dhanmondi' to='banani'
-malformed=[]

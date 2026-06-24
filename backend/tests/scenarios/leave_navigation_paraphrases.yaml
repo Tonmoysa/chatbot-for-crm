@@ -1,0 +1,89 @@
+# Phase 3 — paraphrase lock: many wordings, same expected behavior (rules path).
+# Expanded by load_paraphrase_cases() in yaml_scenario_runner.py
+
+paraphrase_groups:
+  - id: show_draft_during_pending_reason
+    description: User wants summary/navigation — NOT a reason slot answer
+    seed_turns:
+      - user: "5 August 2026 theke 9 August 2026 porjonto annual leave chai"
+    users:
+      - "leave er summery ta daw"
+      - "summery daw"
+      - "summary dekhao"
+      - "amar leave summary daw"
+      - "leave er report ta dao"
+      - "kothay amar leave"
+      - "where is my leave"
+      - "okay leave e back koro"
+      - "leave e jao"
+      - "leave e fire jao"
+      - "abar dekhao"
+      - "review dekhao"
+      - "amar active leave ta dekhao"
+      - "ki ki fill kora ache"
+      - "show my leave"
+      - "leave status report"
+      - "total koto leave"
+      - "amar leave kothay ache"
+      - "tahole amake summary daw"
+      - "tumi bolcho active ache tahole summery dao"
+    expect_any:
+      - "summary|summery|review|leave request|august|annual|status"
+    expect_none:
+      - "clear leave reason"
+      - "not a change command"
+      - "chuti nite chan"
+      - "Mone hocche apni chuti"
+
+  - id: slot_answer_reason_pending
+    description: Genuine reason answers while reason slot is open
+    seed_turns:
+      - user: "5 August 2026 theke 9 August 2026 annual leave chai"
+    users:
+      - "osusto"
+      - "ami osustho"
+      - "family wedding"
+      - "boner biye"
+      - "mamar treatment"
+      - "personal family program"
+    expect_any:
+      - "submit|review|yes|saved|reason|osustho|wedding|family|program|treatment"
+    expect_none:
+      - "clear leave reason"
+      - "Which leave field"
+
+  - id: meta_complaint_not_generic_leave_start
+    description: User questions bot — must not restart leave flow
+    seed_turns:
+      - user: "5 August 2026 theke 9 August 2026 annual leave chai"
+      - user: "osusto"
+      - user: "no"
+    users:
+      - "reason keno modify korcho"
+      - "tumi amar bangla command bujhtecho nah"
+      - "tumi context bujhtecho nah"
+      - "keno reason change korcho"
+      - "ami toh bollam osusto"
+    expect_any:
+      - "summary|draft|reason|osustho|change|modify|august|annual|leave"
+    expect_none:
+      - "chuti nite chan"
+      - "Mone hocche apni chuti"
+      - "leave request shuru korbo"
+      - "submit a leave request"
+
+  - id: bare_modify_not_reason_value
+    description: Command word modify must not become reason text
+    seed_turns:
+      - user: "5 August 2026 theke 9 August 2026 annual leave chai"
+      - user: "osusto"
+      - user: "no"
+    users:
+      - "modify"
+      - "change"
+      - "edit"
+    expect_none:
+      - "reason: modify"
+      - "reason.*modify"
+    expect_any:
+      - "modify|change|field|reason|date|submit|review|august"

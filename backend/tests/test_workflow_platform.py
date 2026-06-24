@@ -7,7 +7,7 @@ import pytest
 from chat.services.pending_question_engine import MessageIntentKind, PendingQuestionEngine
 from chat.services.platform.pipeline import WorkflowPipeline
 from chat.services.platform.registry import get_workflow_definition, list_workflow_ids
-from chat.services.session_memory import ActiveWorkflow, SessionMemory, WorkflowDraft
+from chat.services.session_memory import ActiveWorkflow, SessionMemory, WorkflowDraft, build_turn_context
 
 
 @pytest.fixture
@@ -25,8 +25,9 @@ def test_workflow_definitions_load():
 
 def test_expense_start_from_natural_language(pipeline):
     memory = SessionMemory()
-    with patch("chat.services.platform.ai_understanding.LLMClient") as mock_cls:
-        mock_cls.return_value.is_configured.return_value = False
+    from tests.helpers.expense_llm_mock import mock_expense_llm
+
+    with mock_expense_llm():
         from chat.services.platform.ai_understanding import AIUnderstandingLayer
 
         layer = AIUnderstandingLayer()
@@ -73,12 +74,32 @@ def test_leave_collection_flow(pipeline):
     )
     with patch("chat.services.platform.ai_understanding.LLMClient") as mock_cls:
         mock_cls.return_value.is_configured.return_value = False
-        msg, decision = pipeline.handle(
+        from chat.services.platform.ai_understanding import AIUnderstandingLayer
+
+        layer = AIUnderstandingLayer()
+        u = layer.understand(
             "I need sick leave starting tomorrow",
             memory=memory,
+            conversation_history=[],
+            trace_id="t3",
+        )
+        ctx = build_turn_context(
+            message="I need sick leave starting tomorrow",
+            memory=memory,
+            conversation_history=[],
+            trace_id="t3",
+            session_id="s-test",
+            company_id="c-test",
+            employee_id="e-test",
+        )
+        msg, decision = pipeline.execute_workflow_turn(
+            "I need sick leave starting tomorrow",
+            memory=memory,
+            understanding=u,
             pq_decision=pq,
             conversation_history=[],
             trace_id="t3",
+            turn_context=ctx,
         )
     assert msg
     assert decision.get("outcome") == "NEEDS_INPUT"
@@ -108,12 +129,32 @@ def test_modify_expense_amount(pipeline):
     )
     with patch("chat.services.platform.ai_understanding.LLMClient") as mock_cls:
         mock_cls.return_value.is_configured.return_value = False
-        msg, decision = pipeline.handle(
+        from chat.services.platform.ai_understanding import AIUnderstandingLayer
+
+        layer = AIUnderstandingLayer()
+        u = layer.understand(
+            "Use 200 instead of 150",
+            memory=memory,
+            conversation_history=[],
+            trace_id="t4",
+        )
+        ctx = build_turn_context(
+            message="Use 200 instead of 150",
+            memory=memory,
+            conversation_history=[],
+            trace_id="t4",
+            session_id="s-test",
+            company_id="c-test",
+            employee_id="e-test",
+        )
+        msg, decision = pipeline.execute_workflow_turn(
             "Use 200 instead of 150",
             memory=memory,
             pq_decision=pq,
+            understanding=u,
             conversation_history=[],
             trace_id="t4",
+            turn_context=ctx,
         )
     assert "200" in msg or decision.get("outcome") == "NEEDS_INPUT"
     items = memory.active_draft().fields.get("items") or []

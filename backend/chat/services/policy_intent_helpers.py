@@ -22,6 +22,13 @@ def is_rules_query(message: str) -> bool:
         return False
     if is_policy_handbook_complaint(message):
         return False
+    try:
+        from chat.services.platform.intent_rules import is_workflow_application_message
+
+        if is_workflow_application_message(message):
+            return False
+    except Exception:
+        pass
     low = message.lower()
     for pat in _RULES_QUERY_PATTERNS:
         if re.search(pat, low):

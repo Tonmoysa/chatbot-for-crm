@@ -7,6 +7,108 @@ from datetime import date, timedelta
 
 from chat.services.platform.field_extractors.common import MONTHS
 
+_WEEKDAY_NAMES: dict[str, int] = {
+    "monday": 0,
+    "mon": 0,
+    "tuesday": 1,
+    "tue": 1,
+    "tues": 1,
+    "wednesday": 2,
+    "wed": 2,
+    "thursday": 3,
+    "thu": 3,
+    "thur": 3,
+    "thurs": 3,
+    "friday": 4,
+    "fri": 4,
+    "saturday": 5,
+    "sat": 5,
+    "sunday": 6,
+    "sun": 6,
+}
+
+_WDAY_TOKEN = (
+    r"monday|mon|tuesday|tue(?:s)?|wednesday|wed|thursday|thu(?:r(?:s)?)?|"
+    r"friday|fri|saturday|sat|sunday|sun"
+)
+_WDAY_MOD = r"(?:next|this|coming|upcoming|agami|agamik|poroborti)"
+
+
+def _weekday_index(name: str) -> int | None:
+    key = (name or "").strip().lower()
+    if key in _WEEKDAY_NAMES:
+        return _WEEKDAY_NAMES[key]
+    for token, idx in _WEEKDAY_NAMES.items():
+        if token.startswith(key[:3]):
+            return idx
+    return None
+
+
+def _resolve_weekday(
+    name: str,
+    today: date,
+    *,
+    modifier: str = "",
+    not_before: date | None = None,
+) -> date | None:
+    dow = _weekday_index(name)
+    if dow is None:
+        return None
+    anchor = not_before or today
+    days_ahead = dow - anchor.weekday()
+    mod = (modifier or "").strip().lower()
+    if not_before is not None:
+        if days_ahead <= 0:
+            days_ahead += 7
+    elif mod in ("next", "agami", "agamik", "upcoming", "coming", "poroborti"):
+        if days_ahead <= 0:
+            days_ahead += 7
+    elif days_ahead < 0:
+        days_ahead += 7
+    return anchor + timedelta(days=days_ahead)
+
+
+def _parse_weekday_span(message: str, *, today: date) -> dict[str, str]:
+    """Parse weekday ranges like 'next Wednesday theke Friday'."""
+    low = (message or "").lower()
+    out: dict[str, str] = {}
+
+    range_re = re.compile(
+        rf"(?P<smod>{_WDAY_MOD})?\s*(?P<sday>{_WDAY_TOKEN})\b"
+        rf".{{0,30}}?(?:theke|to|through|until|thru|porjonto|-|–)\s*"
+        rf"(?P<emod>{_WDAY_MOD})?\s*(?P<eday>{_WDAY_TOKEN})\b",
+        re.I | re.UNICODE,
+    )
+    m = range_re.search(low)
+    if m:
+        start = _resolve_weekday(
+            m.group("sday"),
+            today,
+            modifier=m.group("smod") or "",
+        )
+        if start:
+            end = _resolve_weekday(
+                m.group("eday"),
+                today,
+                modifier=m.group("emod") or "",
+                not_before=start,
+            )
+            if end:
+                out["start_date"] = start.isoformat()
+                out["end_date"] = end.isoformat()
+                return out
+
+    single_re = re.compile(
+        rf"(?P<mod>{_WDAY_MOD})?\s*(?P<day>{_WDAY_TOKEN})\b",
+        re.I | re.UNICODE,
+    )
+    sm = single_re.search(low)
+    if sm:
+        start = _resolve_weekday(sm.group("day"), today, modifier=sm.group("mod") or "")
+        if start:
+            out["start_date"] = start.isoformat()
+    return out
+
 
 def parse_relative_date(message: str, *, today: date | None = None) -> str | None:
     today = today or date.today()
@@ -15,7 +117,11 @@ def parse_relative_date(message: str, *, today: date | None = None) -> str | Non
 
     if re.search(r"\b(ajke|ajker|today|aaj)\b", low) or "আজ" in raw:
         return today.isoformat()
-    if re.search(r"\b(kal|agamikal|tomorrow)\b", low) or "আগামীকাল" in raw:
+    if (
+        re.search(r"\b(kalke|kal|agamikal|agamikalke|tomorrow)\b", low)
+        or "আগামীকাল" in raw
+        or "কালকে" in raw
+    ):
         return (today + timedelta(days=1)).isoformat()
     if re.search(r"\b(goto|yesterday)\b", low) or "গতকাল" in raw:
         return (today - timedelta(days=1)).isoformat()
@@ -102,9 +208,13 @@ def parse_leave_dates(message: str, *, today: date | None = None) -> dict[str, s
         if len(found) > 1:
             out["end_date"] = found[-1]
     else:
-        single = parse_relative_date(message, today=today)
-        if single:
-            out["start_date"] = single
+        weekday_span = _parse_weekday_span(message, today=today)
+        if weekday_span:
+            out.update(weekday_span)
+        else:
+            single = parse_relative_date(message, today=today)
+            if single:
+                out["start_date"] = single
 
     return out
 

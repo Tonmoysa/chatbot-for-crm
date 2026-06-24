@@ -20,29 +20,16 @@ fields:
       - name: category
         type: enum
         required: true
-        enum: [meals, travel, accommodation, supplies, other]
+        enum: [lunch, snack, bus, train, bike, metro_rail, metro, rickshaw]
       - name: amount
         type: number
         required: true
-      - name: description
-        type: text
+      - name: from_location
+        type: string
         optional: true
-
-  - name: from_location
-    type: string
-    conditional:
-      field: items
-      any_item_category: travel
-    prompt_en: "Where did you travel from?"
-    prompt_bn: "কোথা থেকে যাত্রা?"
-
-  - name: to_location
-    type: string
-    conditional:
-      field: items
-      any_item_category: travel
-    prompt_en: "Where did you travel to?"
-    prompt_bn: "কোথায় গিয়েছেন?"
+      - name: to_location
+        type: string
+        optional: true
 
 validation_rules:
   - id: incurred_date_required
@@ -69,12 +56,18 @@ validation_rules:
     message_en: "Each item amount must be greater than zero."
     message_bn: "প্রতিটি amount ০-এর বেশি হতে হবে।"
 
-  - id: travel_route_required
-    type: travel_route_required
+  - id: item_travel_route_required
+    type: item_travel_route_required
     params:
       items_field: items
-      category: travel
-      from_field: from_location
-      to_field: to_location
-    message_en: "Travel expenses require from and to locations."
-    message_bn: "Travel খরচে from ও to location প্রয়োজন।"
+      travel_categories: [bus, train, bike, metro_rail, metro, rickshaw]
+    message_en: "Travel expenses require from and to locations on each item."
+    message_bn: "Travel খরচে প্রতিটি item-এ from ও to location প্রয়োজন।"
+
+  - id: supported_category_only
+    type: supported_expense_categories
+    params:
+      items_field: items
+      allowed: [lunch, snack, bus, train, bike, metro_rail, metro, rickshaw]
+    message_en: "Only Lunch, Snack, Bus, Train, Bike, Metro Rail, Metro, and Rickshaw are supported."
+    message_bn: "শুধু Lunch, Snack, Bus, Train, Bike, Metro Rail, Metro ও Rickshaw গ্রহণযোগ্য।"

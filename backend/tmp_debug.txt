@@ -1,5 +1,0 @@
-﻿rules_only {'amount': 3.0, 'currency': None, 'days': 3.0, 'leave_type': None, 'leave_payment_category': None, 'day_scope': None, 'request_id': None, 'description': None, 'policy_topic': None, 'reason': None, 'expense_incurred_date': None, 'expense_lines': None, 'document_read': None}
-pipe entities {'days': 3.0, 'reason': 'family program'}
-pipe field_sources {'days': 'duration', 'reason': 'rules_reason'}
-draft leave_type annual
-draft keys {'reason': 'family program', 'days': 3.0, 'leave_type': 'annual', 'leave_payment_category': 'paid', 'day_scope': 'full'}
