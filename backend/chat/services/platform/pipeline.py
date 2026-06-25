@@ -786,6 +786,11 @@ class PlanBuilder:
 
         if workflow_id == "expense":
             intent = expense_intent
+            from chat.services.platform.intent_rules import (
+                is_compound_expense_message,
+                is_expense_message,
+            )
+
             if intent in (
                 "add",
                 "update",
@@ -808,6 +813,8 @@ class PlanBuilder:
             ) or (
                 intent == "conversation"
                 and u.field_updates
+            ) or (
+                is_expense_message(message) or is_compound_expense_message(message)
             ):
                 return ExecutionPlan(
                     ops=[PlanOp.WORKFLOW_COLLECT],
@@ -1101,6 +1108,11 @@ class PlanBuilder:
 
         if pending == "submit" and workflow_id == "expense":
             intent = str((u.entities or {}).get("expense_intent") or "").lower()
+            from chat.services.platform.intent_rules import (
+                is_compound_expense_message,
+                is_expense_message,
+            )
+
             if intent in (
                 "add",
                 "update",
@@ -1123,6 +1135,8 @@ class PlanBuilder:
             ) or (
                 intent == "conversation"
                 and u.field_updates
+            ) or (
+                is_expense_message(message) or is_compound_expense_message(message)
             ):
                 return ExecutionPlan(
                     ops=[PlanOp.WORKFLOW_COLLECT],
@@ -2219,6 +2233,7 @@ class WorkflowPipeline:
             is_leave_navigation_from_expense,
             is_modify_request,
         )
+        from chat.services.platform.field_extractors.route import parse_route
         from chat.services.platform.schemas import FieldUpdate, UnderstandingAction
 
         if is_cancel_workflow_message(message, workflow_id="expense") or (
@@ -2229,6 +2244,35 @@ class WorkflowPipeline:
                 "outcome": "CANCELLED",
                 "rules_applied": ["EXPENSE_CANCEL"],
             }
+
+        from chat.services.platform.field_extractors.expense import coerce_pending_expense_turn
+
+        coerced_pending = coerce_pending_expense_turn(message, memory)
+        if coerced_pending and coerced_pending.get("item_patches"):
+            from chat.services.platform.field_extractors.expense import (
+                expense_turn_to_field_updates,
+            )
+
+            _, pending_updates = expense_turn_to_field_updates(
+                message,
+                memory,
+                trace_id=trace_id,
+                conversation_history=conversation_history,
+            )
+            if pending_updates:
+                return self._finish_expense_update_turn(
+                    memory,
+                    defn,
+                    updates=_review_safe_updates(list(pending_updates)),
+                    message=message,
+                    lang=lang,
+                    state=state,
+                    was_submit=was_submit,
+                    rules_applied=["EXPENSE_PENDING_ROUTE"],
+                    conversation_history=conversation_history,
+                    trace_id=trace_id,
+                    understanding=u,
+                )
 
         if u.action == UnderstandingAction.DELETE.value and u.targets:
             idx = u.targets[0].item_index
@@ -2253,7 +2297,7 @@ class WorkflowPipeline:
                     understanding=u,
                 )
 
-        if draft and is_delete_request(message):
+        if draft and is_delete_request(message) and not parse_route(message):
             parsed_del = parse_delete_request(message, list(draft.fields.get("items") or []))
             if parsed_del:
                 return self._finish_expense_update_turn(
@@ -3114,8 +3158,20 @@ class WorkflowPipeline:
             collect_mode=expense_collect,
         )
         missing = self.fields.missing_fields(draft, defn)
-        if errors and not (expense_collect and missing):
-            return errors[0], {"outcome": "NEEDS_INPUT", "errors": errors}
+        if errors:
+            if defn.workflow_id == "expense" and missing:
+                if memory.pending_confirmation == "submit":
+                    state.push("clear_pending_confirmation")
+                return self._continue_collection(
+                    memory,
+                    defn,
+                    lang=lang,
+                    prefix=prefix,
+                    state=state,
+                    extra_rules=rules_applied,
+                )
+            if not (expense_collect and missing):
+                return errors[0], {"outcome": "NEEDS_INPUT", "errors": errors}
 
         if missing:
             if memory.pending_confirmation == "submit":

@@ -253,6 +253,10 @@ def coerce_pending_expense_turn(
     """Obvious pending-slot answers — canonical enum/amount only, not narrative parsing."""
     from chat.services.platform.banglish_normalize import normalize_banglish_message
 
+    route_turn = _coerce_expense_route_answer_turn(message, memory)
+    if route_turn:
+        return route_turn
+
     pq = memory.pending_question if memory else None
     if not pq or pq.workflow_id != "expense" or pq.item_index is None:
         return None
@@ -299,6 +303,55 @@ def coerce_pending_expense_turn(
                     ],
                 }
     return None
+
+
+def _coerce_expense_route_answer_turn(message: str, memory) -> dict[str, Any] | None:
+    """Route-only replies (e.g. mirpur to badda) for the open travel slot."""
+    from chat.services.platform.banglish_normalize import normalize_banglish_message
+    from chat.services.platform.field_extractors.route import parse_route
+    from chat.services.platform.intent_rules import is_expense_add_request
+
+    if is_expense_add_request(message):
+        return None
+    raw = normalize_banglish_message((message or "").strip())
+    if not raw:
+        return None
+    route = parse_route(raw) or parse_route(message)
+    if not route:
+        return None
+    frm, to = route
+    if not is_valid_expense_route(frm, to):
+        return None
+
+    draft = memory.active_draft() if memory else None
+    if not draft:
+        return None
+    items = list(draft.fields.get("items") or [])
+    queue = build_pending_queue(items)
+    route_entries = [e for e in queue if e.field == "route"]
+    if not route_entries:
+        return None
+
+    pq = memory.pending_question if memory else None
+    idx: int | None = None
+    if pq and pq.workflow_id == "expense" and pq.field == "item_route" and pq.item_index is not None:
+        idx = int(pq.item_index)
+    elif len(route_entries) == 1:
+        idx = route_entries[0].item_index
+    if idx is None or not (0 <= idx < len(items)):
+        return None
+
+    return {
+        "intent": "answer_pending",
+        "item_patches": [
+            {
+                "action": "update",
+                "item_index": idx,
+                "from_location": frm,
+                "to_location": to,
+            }
+        ],
+    }
 
 
 def _pending_missing_field(
@@ -707,14 +760,13 @@ def _expense_rules_fallback_turn(
             backfill["llm_degraded"] = True
         return _log_and_return_expense_turn(trace_id, raw, backfill, llm_used=False)
 
-    if not (memory and is_expense_review_mode(memory)):
-        wizard = _try_wizard_fallback_turn(raw, memory)
-        if wizard:
-            if llm_degraded:
-                wizard["llm_degraded"] = True
-            return _log_and_return_expense_turn(
-                trace_id, raw, wizard, llm_used=False, wizard_fallback=True
-            )
+    wizard = _try_wizard_fallback_turn(raw, memory)
+    if wizard:
+        if llm_degraded:
+            wizard["llm_degraded"] = True
+        return _log_and_return_expense_turn(
+            trace_id, raw, wizard, llm_used=False, wizard_fallback=True
+        )
 
     turn = {"intent": "conversation", "item_patches": []}
     if llm_degraded:
@@ -1487,6 +1539,14 @@ def sanitize_expense_review_updates(
     if not items:
         return []
 
+    append_updates = [
+        u
+        for u in (updates or [])
+        if getattr(u, "field", None) == "items" and getattr(u, "action", None) == "append"
+    ]
+    if append_updates:
+        return append_updates
+
     from chat.services.platform.intent_rules import is_delete_request
 
     delete_updates = [
@@ -1544,6 +1604,18 @@ def review_field_updates_from_message(
     understanding_updates: list | None = None,
 ) -> list:
     """Primary expense review edit path — sanitize LLM patches, then rules-first parsers."""
+    from chat.services.platform.intent_rules import (
+        is_compound_expense_message,
+        is_expense_message,
+    )
+
+    if is_expense_message(message) or is_compound_expense_message(message):
+        wizard = _try_wizard_fallback_turn(message, memory)
+        if wizard and _turn_has_actionable_patches(wizard):
+            draft = memory.active_draft()
+            fields = dict(draft.fields or {}) if draft else {"items": []}
+            return patches_to_field_updates(fields, wizard)
+
     delete_turn = coerce_expense_delete_turn(message, memory)
     if delete_turn and delete_turn.get("item_patches"):
         draft = memory.active_draft()
@@ -1596,6 +1668,15 @@ def filter_expense_updates_for_review(
 ) -> list:
     if not is_expense_review_mode(memory):
         return list(updates or [])
+
+    append_updates = [
+        u
+        for u in (updates or [])
+        if getattr(u, "field", None) == "items" and getattr(u, "action", None) == "append"
+    ]
+    if append_updates:
+        return append_updates
+
     return review_field_updates_from_message(
         message,
         memory,

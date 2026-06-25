@@ -865,8 +865,9 @@ _MODIFY_HINT_RE = re.compile(
 
 _DELETE_HINT_RE = re.compile(
     r"(?:"
-    r"\b(delete|remove|drop|cancel\s+that|undo)\b|"
-    r"(?:মুছ|ডিলিট|remove\s*koro|bad\s*d[aeiou]?[oy]?|muche|মুছে)"
+    r"\b(delete|remove|drop|undo)\b|"
+    r"\b(cancel\s+that|muche|muchey|muche\s*felo)\b|"
+    r"\bbad\s*dao\b|\bbad\s*de\b|\bbad\s*dia\b|\bbad\s*dite\b"
     r")",
     re.I | re.UNICODE,
 )
