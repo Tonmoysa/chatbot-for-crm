@@ -180,6 +180,17 @@ def intent_priority_decision(
             extracted_entities={"interrupts_pending": bool(pq)},
         )
 
+    def _decision(kind: MessageIntentKind, *, reasoning: str, target: str | None = None):
+        return PendingQuestionDecision(
+            kind=kind,
+            confidence=max(conf, 0.88),
+            reasoning=reasoning,
+            source=src,
+            blocks_new_workflow=True,
+            target_workflow=target or (aw.id if aw else wf or None),
+            extracted_entities={"interrupts_pending": bool(pq)},
+        )
+
     from chat.services.platform.intent_rules import is_bare_confirmation
 
     if (
@@ -189,7 +200,7 @@ def intent_priority_decision(
         and pq.field in ("item_route", "item_category", "item_amount", "route")
     ):
         return _decision(
-            MessageIntentKind.ANSWER_PENDING,
+            MessageIntentKind.CLARIFICATION_NEEDED,
             reasoning=f"Pending {pq.field} — need a field value, not yes/no.",
         )
 
@@ -207,17 +218,6 @@ def intent_priority_decision(
             source=src,
             blocks_new_workflow=True,
             target_workflow=understanding.interrupt_workflow,
-            extracted_entities={"interrupts_pending": bool(pq)},
-        )
-
-    def _decision(kind: MessageIntentKind, *, reasoning: str, target: str | None = None):
-        return PendingQuestionDecision(
-            kind=kind,
-            confidence=max(conf, 0.88),
-            reasoning=reasoning,
-            source=src,
-            blocks_new_workflow=True,
-            target_workflow=target or (aw.id if aw else wf or None),
             extracted_entities={"interrupts_pending": bool(pq)},
         )
 
@@ -240,6 +240,21 @@ def intent_priority_decision(
         understanding.field_updates
         or expense_turn_has_targeted_patches(expense_turn, memory)
     )
+    if message_has_new_expense_items(message) and pq and pq.workflow_id == "expense":
+        from chat.services.platform.field_extractors.expense import _should_compound_add_over_mutation
+
+        expense_turn = (understanding.entities or {}).get("expense_turn")
+        if _should_compound_add_over_mutation(
+            expense_turn if isinstance(expense_turn, dict) else None,
+            message,
+            memory,
+        ):
+            return _decision(
+                MessageIntentKind.MODIFY_DATA,
+                reasoning=understanding.reasoning or "Add new expense line while collecting.",
+                target=aw.id if aw else "expense",
+            )
+
     if understanding.action == UnderstandingAction.MODIFY.value or expense_intent in (
         "modify_review",
         "update",
@@ -504,6 +519,28 @@ def informational_priority_decision(
                 target_workflow=cancel_wf,
             )
 
+    aw = memory.active_workflow
+    from chat.services.platform.intent_rules import (
+        expense_navigation_kind,
+        should_resume_suspended_expense,
+    )
+
+    if should_resume_suspended_expense(
+        message=raw,
+        active_workflow_id=aw.id if aw else None,
+        suspended_workflows=memory.suspended_workflows,
+    ):
+        nav = expense_navigation_kind(raw)
+        return PendingQuestionDecision(
+            kind=MessageIntentKind.SWITCH_WORKFLOW,
+            confidence=0.94,
+            reasoning="Navigate to suspended expense draft.",
+            source="rules",
+            blocks_new_workflow=True,
+            target_workflow="expense",
+            extracted_entities={"expense_navigation": nav},
+        )
+
     from chat.services.platform.workflow_show import (
         _message_might_be_show_request,
         resolve_workflow_show_target,
@@ -527,7 +564,11 @@ def informational_priority_decision(
                 target_workflow=show_wf,
             )
 
+    from chat.services.platform.field_extractors.expense import is_expense_pending_field_value_answer
     from chat.services.platform.intent_rules import is_clearly_off_hr_question, is_off_hr_topic_message
+
+    if pq and pq.workflow_id == "expense" and is_expense_pending_field_value_answer(raw, memory):
+        return None
 
     if is_clearly_off_hr_question(raw) or is_off_hr_topic_message(raw, memory=memory):
         return PendingQuestionDecision(
@@ -617,22 +658,6 @@ def informational_priority_decision(
                     target_workflow=aw.id if aw else "expense",
                     extracted_entities={"interrupts_pending": bool(pq)},
                 )
-
-    if should_resume_suspended_expense(
-        message=raw,
-        active_workflow_id=aw.id if aw else None,
-        suspended_workflows=memory.suspended_workflows,
-    ):
-        nav = expense_navigation_kind(raw)
-        return PendingQuestionDecision(
-            kind=MessageIntentKind.SWITCH_WORKFLOW,
-            confidence=0.94,
-            reasoning="Navigate to suspended expense draft.",
-            source="rules",
-            blocks_new_workflow=True,
-            target_workflow="expense",
-            extracted_entities={"expense_navigation": nav},
-        )
 
     if (
         not expense_review_edit
@@ -1115,6 +1140,22 @@ class PendingQuestionEngine:
                 source="plan_shortcut",
                 entities=entities,
             )
+        if pq.kind == MessageIntentKind.SWITCH_WORKFLOW:
+            wf = (pq.target_workflow or "expense").strip().lower()
+            nav = str((pq.extracted_entities or {}).get("expense_navigation") or "").strip().lower()
+            if nav:
+                entities["expense_navigation"] = nav
+            action = UnderstandingAction.REVIEW.value if nav == "summary" else UnderstandingAction.COLLECT.value
+            return UnderstandingResult(
+                goal=f"Switch to {wf}",
+                workflow=wf,
+                action=action,
+                confidence=pq.confidence,
+                reasoning=pq.reasoning,
+                source="plan_shortcut",
+                entities=entities,
+                interrupt_workflow=wf,
+            )
         if pq.kind == MessageIntentKind.OUT_OF_SCOPE:
             return UnderstandingResult(
                 goal="Out of scope",
@@ -1431,9 +1472,17 @@ class PendingQuestionEngine:
             aw and aw.id == "expense" and is_expense_review_edit_turn(message, memory, understanding)
         )
 
+        from chat.services.platform.field_extractors.expense import is_expense_pending_field_value_answer
         from chat.services.platform.intent_rules import is_clearly_off_hr_question, is_off_hr_topic_message
 
-        if is_clearly_off_hr_question(message) or is_off_hr_topic_message(message, memory=memory):
+        if not (
+            pq
+            and pq.workflow_id == "expense"
+            and is_expense_pending_field_value_answer(message, memory)
+        ) and (
+            is_clearly_off_hr_question(message)
+            or is_off_hr_topic_message(message, memory=memory)
+        ):
             return PendingQuestionDecision(
                 kind=MessageIntentKind.OUT_OF_SCOPE,
                 confidence=max(conf, 0.9),

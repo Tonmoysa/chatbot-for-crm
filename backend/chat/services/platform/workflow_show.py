@@ -211,7 +211,7 @@ def resolve_workflow_show_target(
     except Exception:
         llm_target = None
 
-    out = llm_target or rules
+    out = rules if rules in ("leave", "expense") else (llm_target or rules)
     if key:
         _SHOW_SEMANTICS_CACHE[key] = out
     return out

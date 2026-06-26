@@ -393,12 +393,15 @@ def is_workflow_turn_message(message: str, *, memory=None) -> bool:
         return True
 
     if active_id == "expense" and memory is not None:
+        from chat.services.platform.field_extractors.expense import is_expense_pending_field_value_answer
         from chat.services.platform.field_extractors.modify import (
             looks_like_expense_item_delete,
             parse_delete_request,
             parse_modify_request,
         )
 
+        if is_expense_pending_field_value_answer(raw, memory):
+            return True
         if looks_like_expense_item_delete(raw):
             return True
         draft = memory.active_draft() if hasattr(memory, "active_draft") else None

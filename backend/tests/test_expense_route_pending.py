@@ -196,6 +196,74 @@ def test_dhanmondi_to_mirpur_route_coerced_without_llm():
     assert "route" not in (bus.get("missing_fields") or [])
 
 
+def test_bike_route_answer_not_marked_out_of_scope_when_scope_llm_misfires():
+    """Regression: 'badda to gulshan' answering pending bike route must not OOS."""
+    from unittest.mock import patch
+
+    from chat.services.platform.ai_understanding import AIUnderstandingLayer
+    from chat.services.platform.schemas import UnderstandingAction, UnderstandingResult
+
+    memory = _expense_route_pending_memory()
+    memory.pending_question = PendingQuestion(
+        field="item_route",
+        prompt="Expense 3 — Bike — 120.0 taka: where did you travel from and to?",
+        workflow_id="expense",
+        item_index=2,
+    )
+    memory.workflow_drafts["default"].fields["items"] = [
+        {"category": "lunch", "amount": 100.0, "status": "complete"},
+        {
+            "category": "bus",
+            "amount": 40.0,
+            "status": "complete",
+            "from_location": "Mirpur",
+            "to_location": "Badda",
+        },
+        {"category": "bike", "amount": 120.0, "missing_fields": ["route"], "status": "incomplete"},
+    ]
+
+    scope_oos = UnderstandingResult(
+        goal="Out of scope",
+        workflow="none",
+        action=UnderstandingAction.NONE.value,
+        confidence=0.9,
+        is_out_of_scope=True,
+        reasoning="Place names without HR context.",
+        source="llm_hr_scope",
+    )
+
+    with patch(
+        "chat.services.platform.hr_assistant_scope.resolve_hr_assistant_scope",
+        return_value=scope_oos,
+    ):
+        understanding = AIUnderstandingLayer().understand(
+            "badda to gulshan",
+            memory=memory,
+            conversation_history=[
+                "Assistant: Expense 3 — Bike — 120.0 taka: where did you travel from and to?",
+            ],
+            trace_id="test-bike-route-oos",
+        )
+
+    assert not understanding.is_out_of_scope
+    assert understanding.workflow == "expense"
+    updates = understanding.field_updates or []
+    assert updates
+    assert updates[0].value.get("from_location") == "Badda"
+    assert updates[0].value.get("to_location") == "Gulshan"
+    decision = PendingQuestionEngine().classify(
+        "badda to gulshan",
+        memory=memory,
+        conversation_history=[],
+        trace_id="test-bike-route-oos",
+        understanding=understanding,
+    )
+    assert decision.kind in (
+        MessageIntentKind.ANSWER_PENDING,
+        MessageIntentKind.MODIFY_DATA,
+    )
+
+
 def test_leave_back_during_expense_pending_switches_not_slot_answer():
     """'leave e back koro' must resume leave — not answer expense category slot."""
     memory = _expense_route_pending_memory()

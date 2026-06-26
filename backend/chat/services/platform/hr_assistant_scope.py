@@ -42,6 +42,11 @@ def resolve_hr_assistant_scope(
     if not raw:
         return None
 
+    from chat.services.platform.field_extractors.expense import is_expense_pending_field_value_answer
+
+    if is_expense_pending_field_value_answer(raw, memory):
+        return None
+
     from chat.services.llm_client import LLMClient
 
     client = LLMClient()

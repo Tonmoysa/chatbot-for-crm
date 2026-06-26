@@ -139,6 +139,29 @@ class AIUnderstandingLayer:
             self._log(trace_id, raw, memory, guarded)
             return guarded
 
+        from chat.services.platform.field_extractors.expense import is_expense_pending_field_value_answer
+
+        if (
+            memory.pending_question
+            and memory.active_workflow
+            and memory.active_workflow.id == "expense"
+            and is_expense_pending_field_value_answer(raw, memory)
+        ):
+            from chat.services.platform.turn_semantics import enrich_answers_pending_field
+
+            expense_result = self._expense_collect(
+                raw,
+                memory,
+                "expense",
+                conversation_history=conversation_history,
+            )
+            expense_result.answers_pending_field = True
+            expense_result.is_out_of_scope = False
+            result = enrich_answers_pending_field(message, memory, expense_result)
+            guarded = apply_confidence_guard(result)
+            self._log(trace_id, raw, memory, guarded)
+            return guarded
+
         if client.is_configured():
             from chat.services.platform.hr_assistant_scope import resolve_hr_assistant_scope
 
@@ -1388,6 +1411,20 @@ class AIUnderstandingLayer:
             return _gatekeeper_copy(expense_rules)
 
         if wizard_semantics_active(memory) and llm_result.is_out_of_scope and not is_programming_question(message):
+            from chat.services.platform.field_extractors.expense import (
+                is_expense_pending_field_value_answer,
+            )
+
+            if is_expense_pending_field_value_answer(message, memory):
+                expense_rules = self._expense_collect(
+                    message,
+                    memory,
+                    active_id,
+                    conversation_history=conversation_history,
+                )
+                expense_rules.answers_pending_field = True
+                expense_rules.is_out_of_scope = False
+                return _gatekeeper_copy(expense_rules)
             if llm_result.source in ("llm_hr_scope", "llm_session_context"):
                 return llm_result
             if is_process_question(message):

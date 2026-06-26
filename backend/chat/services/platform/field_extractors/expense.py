@@ -755,6 +755,44 @@ def expense_turn_is_new_add(turn: dict[str, Any] | None, message: str) -> bool:
     return False
 
 
+def _should_compound_add_over_mutation(
+    turn: dict[str, Any] | None,
+    message: str,
+    memory,
+) -> bool:
+    """New expense line in user text beats LLM modify on the pending slot (e.g. bus while bike route open)."""
+    if not message_has_new_expense_items(message):
+        return False
+    if _message_looks_like_amount_correction(message):
+        return False
+    msg_cat = infer_category_from_clause(message)
+    if not msg_cat:
+        from chat.services.platform.field_extractors.modify import _category_from_message
+
+        msg_cat = _category_from_message((message or "").strip().lower())
+    msg_cat = normalize_expense_category(msg_cat)
+    draft = memory.active_draft() if memory else None
+    items = list((draft.fields.get("items") or []) if draft else [])
+    pq = memory.pending_question if memory else None
+    if pq and pq.workflow_id == "expense" and pq.item_index is not None and msg_cat:
+        idx = int(pq.item_index)
+        if 0 <= idx < len(items):
+            pending_cat = normalize_expense_category(items[idx].get("category"))
+            if pending_cat and msg_cat != pending_cat:
+                return True
+    if msg_cat:
+        existing = {
+            normalize_expense_category(it.get("category"))
+            for it in items
+            if isinstance(it, dict)
+        }
+        if msg_cat not in existing:
+            return True
+    if not expense_turn_is_draft_mutation(turn, message):
+        return True
+    return False
+
+
 def finalize_expense_turn_patches(
     turn: dict[str, Any],
     message: str,
@@ -766,6 +804,11 @@ def finalize_expense_turn_patches(
         "date_policy_rejected"
     ):
         return dict(turn or {})
+    if _should_compound_add_over_mutation(turn, message, memory):
+        wizard = build_wizard_fallback_turn(message, memory)
+        if _turn_has_actionable_patches(wizard):
+            return {**wizard, "intent": "add"}
+        return coerce_compound_expense_add_turn(turn, message, memory)
     if expense_turn_is_draft_mutation(turn, message):
         return dict(turn or {})
     if message_has_new_expense_items(message):
@@ -1695,16 +1738,17 @@ def interpret_expense_draft_turn(
     if not raw:
         return {"intent": "conversation", "item_patches": []}
 
-    from chat.services.platform.hr_assistant_scope import resolve_hr_assistant_scope
+    if not is_expense_pending_field_value_answer(raw, memory):
+        from chat.services.platform.hr_assistant_scope import resolve_hr_assistant_scope
 
-    scope_oos = resolve_hr_assistant_scope(
-        raw,
-        memory,
-        conversation_history=conversation_history,
-        trace_id=trace_id,
-    )
-    if scope_oos is not None and scope_oos.is_out_of_scope:
-        return {"intent": "conversation", "item_patches": [], "off_topic": True}
+        scope_oos = resolve_hr_assistant_scope(
+            raw,
+            memory,
+            conversation_history=conversation_history,
+            trace_id=trace_id,
+        )
+        if scope_oos is not None and scope_oos.is_out_of_scope:
+            return {"intent": "conversation", "item_patches": [], "off_topic": True}
 
     from chat.services.platform.intent_rules import is_greeting_or_chitchat
 
@@ -1761,6 +1805,13 @@ def interpret_expense_draft_turn(
     coerced_pending = coerce_pending_expense_turn(message, memory)
     if coerced_pending:
         return _log_and_return_expense_turn(trace_id, raw, coerced_pending, llm_used=False)
+
+    if _should_compound_add_over_mutation(None, message, memory):
+        wizard_logged = _attempt_wizard_expense_turn(
+            message, memory, trace_id, raw, llm_degraded=False
+        )
+        if wizard_logged is not None:
+            return wizard_logged
 
     active_wf = memory.active_workflow.id if memory and memory.active_workflow else "expense"
     if expense_message_requests_submit(raw, active_workflow_id=active_wf):

@@ -4201,7 +4201,15 @@ class WorkflowPipeline:
         state: StatePatchBuffer,
     ) -> tuple[str, dict[str, Any]] | None:
         u = understanding
+        from chat.services.platform.intent_rules import should_resume_suspended_expense
+
         target = (pq_decision.target_workflow or u.interrupt_workflow or u.workflow or "").strip().lower()
+        if should_resume_suspended_expense(
+            message=message,
+            active_workflow_id=memory.active_workflow.id if memory.active_workflow else None,
+            suspended_workflows=memory.suspended_workflows,
+        ):
+            target = "expense"
         if not target or not get_workflow_definition(target):
             return self.composer.which_workflow(lang=lang), {"outcome": "NEEDS_CLARIFICATION"}
         suspended_before = {sw.workflow_id for sw in memory.suspended_workflows}

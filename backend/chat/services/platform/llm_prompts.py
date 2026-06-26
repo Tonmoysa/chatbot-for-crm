@@ -586,7 +586,7 @@ IN SCOPE (in_scope=true):
 - Greetings and thanks: hi, hello, salam, assalamualaikum, dhonnobad
 - Workflow navigation: summary, review, cancel, submit, switch leave/expense, resume, list dekhao
 - Process questions during a form: "ar ki lagbe", "what else do you need"
-- Short answers to the bot's pending slot question (dates, leave type, reason, amounts)
+- Short answers to the bot's pending slot question (dates, leave type, reason, amounts, travel routes like "mirpur to badda", "badda to gulshan")
 
 OUT OF SCOPE (in_scope=false) — even when leave/expense workflow is active:
 - Jokes, riddles, stories: "ekta joke bol", "amake jokes bolba", "funny story"
@@ -611,4 +611,5 @@ FEW-SHOT
 8) "lunch 200 taka" → in_scope true, expense
 9) "attendance policy ki" → in_scope true, policy
 10) "what is the capital of France" → in_scope false, out_of_scope
+11) active expense, pending item_route for bike, "badda to gulshan" → in_scope true, expense
 """
