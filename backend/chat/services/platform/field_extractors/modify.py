@@ -191,6 +191,42 @@ def _numbered_item_index(message: str, *, item_count: int) -> int | None:
     return None
 
 
+def parse_multiple_item_indices(
+    message: str,
+    *,
+    item_count: int,
+    candidate_indices: list[int] | None = None,
+) -> list[int]:
+    """Parse multi-select replies like '2 and 3' or '2, 3' (1-based entry numbers)."""
+    raw = (message or "").strip().lower()
+    if not raw or item_count <= 0:
+        return []
+    nums = [int(n) for n in re.findall(r"\b(\d+)\b", raw)]
+    if not nums:
+        return []
+
+    if candidate_indices:
+        ordered = sorted({int(i) for i in candidate_indices})
+        # When clarify listed a subset, numbers refer to positions in that list.
+        if len(ordered) < item_count:
+            indices: list[int] = []
+            for n in nums:
+                pos = n - 1
+                if 0 <= pos < len(ordered):
+                    indices.append(ordered[pos])
+            return sorted(set(indices))
+
+    indices = []
+    for n in nums:
+        idx = n - 1
+        if 0 <= idx < item_count:
+            indices.append(idx)
+    if candidate_indices is not None:
+        allowed = {int(i) for i in candidate_indices}
+        indices = [i for i in indices if i in allowed]
+    return sorted(set(indices))
+
+
 def _extract_modify_amount(message: str, *, item_number_1based: int | None = None) -> float | None:
     """Prefer taka-linked amounts; skip the entry number (e.g. '1 number bus 130 taka')."""
     low = (message or "").lower()

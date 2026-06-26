@@ -505,18 +505,33 @@ def reduce_record_submitted_leave_range(
     *,
     request_id: str = "",
 ) -> None:
-    from chat.services.platform.field_extractors.leave import leave_range_from_fields
+    from chat.services.platform.field_extractors.leave import leave_date_ranges_match, leave_range_from_fields
 
     rng = leave_range_from_fields(fields)
     if not rng:
         return
     facts = dict(memory.conversation_facts or {})
     rows = list(facts.get("submitted_leave_ranges") or [])
-    rows.append({
+    new_row = {
         "start_date": rng[0],
         "end_date": rng[1],
         "request_id": request_id,
-    })
+    }
+    for existing in rows:
+        if not isinstance(existing, dict):
+            continue
+        if leave_date_ranges_match(
+            str(new_row["start_date"]),
+            str(new_row["end_date"]),
+            str(existing.get("start_date") or ""),
+            str(existing.get("end_date") or existing.get("start_date") or ""),
+        ):
+            if request_id and not existing.get("request_id"):
+                existing["request_id"] = request_id
+            facts["submitted_leave_ranges"] = rows
+            memory.conversation_facts = facts
+            return
+    rows.append(new_row)
     facts["submitted_leave_ranges"] = rows
     memory.conversation_facts = facts
 
@@ -579,6 +594,41 @@ def reduce_cancel_active_workflow(memory: SessionMemory) -> None:
         return
     memory.workflow_drafts.pop(aw.draft_id, None)
     reduce_set_active_workflow(memory, None)
+    reduce_clear_pending_question(memory)
+    reduce_clear_pending_confirmation(memory)
+    memory.last_action = "workflow_cancelled"
+
+
+def reduce_cancel_workflow_draft(memory: SessionMemory, workflow_id: str) -> None:
+    """Clear a leave/expense draft when no workflow is active (e.g. all suspended)."""
+    wf = (workflow_id or "").strip().lower()
+    if wf not in ("leave", "expense"):
+        return
+
+    draft_ids: set[str] = set()
+    if memory.active_workflow and memory.active_workflow.id == wf:
+        draft_ids.add(memory.active_workflow.draft_id)
+    for sw in list(memory.suspended_workflows or []):
+        if isinstance(sw, dict) and str(sw.get("workflow_id") or "").strip().lower() == wf:
+            draft_ids.add(str(sw.get("draft_id") or wf))
+    if wf == "leave":
+        draft_ids.update({"leave", "default"})
+    if wf == "expense":
+        draft_ids.add("expense")
+
+    for did in draft_ids:
+        draft = (memory.workflow_drafts or {}).get(did)
+        if draft and getattr(draft, "workflow_id", None) == wf:
+            memory.workflow_drafts.pop(did, None)
+
+    memory.suspended_workflows = [
+        sw
+        for sw in (memory.suspended_workflows or [])
+        if not (isinstance(sw, dict) and str(sw.get("workflow_id") or "").strip().lower() == wf)
+    ]
+
+    if memory.active_workflow and memory.active_workflow.id == wf:
+        reduce_set_active_workflow(memory, None)
     reduce_clear_pending_question(memory)
     reduce_clear_pending_confirmation(memory)
     memory.last_action = "workflow_cancelled"
@@ -689,17 +739,36 @@ def reduce_apply_field_updates(
         )
 
         if is_expense_review_mode(memory):
-            updates = filter_expense_updates_for_review(
-                updates,
-                message,
-                memory=memory,
-                trace_id=trace_id,
-            )
+            expense_turn = dict((memory.last_entities or {}).get("expense_turn") or {})
+            turn_intent = str(expense_turn.get("intent") or "").lower()
+            explicit_delete = [
+                u
+                for u in updates
+                if getattr(u, "field", None) == "items"
+                and getattr(u, "action", None) == "delete"
+            ]
+            if explicit_delete:
+                updates = explicit_delete
+            elif turn_intent == "clarify_delete":
+                updates = []
+            else:
+                updates = filter_expense_updates_for_review(
+                    updates,
+                    message,
+                    memory=memory,
+                    trace_id=trace_id,
+                    expense_turn=expense_turn,
+                )
 
     before_fields = dict(draft.fields or {})
     if not updates:
         return []
     FieldEngine().apply_updates(draft, updates, message=message or "")
+
+    if draft.workflow_id == "leave":
+        from chat.services.platform.field_extractors.leave import apply_leave_derived_fields
+
+        apply_leave_derived_fields(draft, message=message or "")
 
     if updates:
         from chat.services.observability import (
@@ -896,8 +965,12 @@ def apply_state_patches(memory: SessionMemory, patches: list[dict[str, Any]]) ->
             reduce_suspend_active_workflow(memory)
         elif op == "cancel_active_workflow":
             reduce_cancel_active_workflow(memory)
+        elif op == "cancel_workflow_draft":
+            reduce_cancel_workflow_draft(memory, str(patch.get("value") or ""))
         elif op == "switch_to_workflow":
             reduce_switch_to_workflow(memory, str(patch.get("value") or ""))
+        elif op == "drop_suspended_workflow":
+            reduce_remove_suspended_workflow(memory, str(patch.get("value") or ""))
         elif op == "lock_submitted_draft":
             reduce_lock_submitted_draft(memory, str(patch.get("request_id") or ""))
         elif op == "arm_switch_confirm":

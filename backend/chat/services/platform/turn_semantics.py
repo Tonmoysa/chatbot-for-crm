@@ -109,6 +109,32 @@ def wizard_semantics_active(memory: SessionMemory) -> bool:
     return False
 
 
+def is_expense_review_request(
+    message: str,
+    understanding: UnderstandingResult | None = None,
+) -> bool:
+    """User wants expense list/summary/status — not leave, not a new line item."""
+    from chat.services.platform.intent_rules import is_expense_draft_query
+
+    raw = normalize_banglish_message((message or "").strip())
+    if not raw:
+        return False
+    if is_expense_draft_query(raw) or is_workflow_show_request(raw, workflow_id="expense"):
+        return True
+    if understanding is None:
+        return False
+    goal_low = (understanding.goal or "").strip().lower()
+    expense_intent = str((understanding.entities or {}).get("expense_intent") or "").lower()
+    if expense_intent in ("show_summary", "show_list", "show_total"):
+        return True
+    if understanding.action == UnderstandingAction.REVIEW.value and (
+        "expense" in goal_low
+        or expense_intent in ("show_summary", "show_list", "show_total")
+    ):
+        return True
+    return False
+
+
 def is_workflow_meta_complaint(message: str) -> bool:
     """User questions bot behavior / context — not a slot answer."""
     raw = normalize_banglish_message(message)
@@ -170,7 +196,34 @@ def enrich_answers_pending_field(
     active_id = aw.id if aw else ""
 
     if memory.pending_confirmation == "submit":
+        from chat.services.platform.field_extractors.expense import expense_message_requests_submit
+        from chat.services.platform.workflow_show import resolve_workflow_show_target
+
         result.answers_pending_field = False
+        active_wf = (active_id or result.workflow or "expense").strip().lower()
+        if expense_message_requests_submit(message, active_workflow_id=active_wf):
+            result.field_updates = []
+            result.action = UnderstandingAction.CONFIRM.value
+            result.workflow = "expense"
+            result.entities = {
+                **(result.entities or {}),
+                "expense_intent": "confirm",
+            }
+            return result
+        show_wf = resolve_workflow_show_target(
+            message,
+            memory,
+            active_workflow_id=active_wf,
+        )
+        if show_wf == "leave":
+            result.field_updates = []
+            result.action = UnderstandingAction.REVIEW.value
+            result.workflow = "leave"
+            result.entities = {
+                **(result.entities or {}),
+                "show_workflow_target": "leave",
+            }
+            return result
         if is_bare_confirmation(message) and result.action not in (
             UnderstandingAction.CONFIRM.value,
             UnderstandingAction.SUBMIT.value,
@@ -182,6 +235,41 @@ def enrich_answers_pending_field(
 
     if not pq:
         return result
+
+    if pq:
+        from chat.services.platform.field_extractors.expense import expense_message_requests_submit
+
+        wf_submit = (pq.workflow_id or active_id or "").strip().lower() or "expense"
+        if wf_submit == "expense" and expense_message_requests_submit(
+            message,
+            active_workflow_id=wf_submit,
+        ):
+            result.answers_pending_field = False
+            result.field_updates = []
+            result.action = UnderstandingAction.CONFIRM.value
+            result.workflow = "expense"
+            result.entities = {
+                **(result.entities or {}),
+                "expense_intent": "confirm",
+            }
+            return result
+        from chat.services.platform.workflow_show import resolve_workflow_show_target
+
+        show_wf = resolve_workflow_show_target(
+            message,
+            memory,
+            active_workflow_id=active_id or wf_submit,
+        )
+        if show_wf == "leave":
+            result.answers_pending_field = False
+            result.field_updates = []
+            result.action = UnderstandingAction.REVIEW.value
+            result.workflow = "leave"
+            result.entities = {
+                **(result.entities or {}),
+                "show_workflow_target": "leave",
+            }
+            return result
 
     wf_id = (pq.workflow_id or active_id or "").strip().lower()
     explicit = result.answers_pending_field
@@ -195,15 +283,51 @@ def enrich_answers_pending_field(
         "anti_summary",
         "clarify_modify",
         "clarify_delete",
+        "date_not_allowed",
+        "date_correction",
+        "replay_blocked_add",
         "fix_mistake",
+        "update",
+        "modify_review",
+        "correct",
+        "delete",
+        "show_summary",
+        "show_list",
+        "show_total",
     ):
         result.answers_pending_field = False
         if expense_intent == "anti_summary":
             result.entities = {**(result.entities or {}), "meta_complaint": True, "anti_summary": True}
-        if not result.field_updates:
+        if expense_intent == "date_not_allowed":
+            result.action = UnderstandingAction.COLLECT.value
+            result.workflow = "expense"
+            return result
+        if not result.field_updates and expense_intent not in (
+            "date_correction",
+            "replay_blocked_add",
+        ):
             result.action = UnderstandingAction.CLARIFICATION_NEEDED.value
             result.workflow = "expense"
         return result
+
+    if wf_id == "expense":
+        from chat.services.platform.field_extractors.expense import (
+            is_expense_draft_mutation_message,
+            message_has_new_expense_items,
+            resolve_pending_expense_edit_turn,
+        )
+
+        if message_has_new_expense_items(message):
+            result.answers_pending_field = False
+            return result
+
+        if is_expense_draft_mutation_message(message, memory):
+            result.answers_pending_field = False
+            return result
+
+        if resolve_pending_expense_edit_turn(message, memory):
+            result.answers_pending_field = False
+            return result
 
     if wf_id == "expense":
         from chat.services.platform.field_extractors.expense import is_expense_anti_summary_request
@@ -316,6 +440,53 @@ def enrich_answers_pending_field(
     return result
 
 
+def should_skip_session_context_llm(message: str, memory: SessionMemory) -> bool:
+    """Full domain turns must not be misread as yes/no session replies."""
+    from chat.services.platform.intent_rules import (
+        is_compound_expense_message,
+        is_expense_draft_query,
+        is_expense_message,
+        is_leave_message,
+        is_workflow_interrupt_expense,
+    )
+    from chat.services.platform.workflow_show import (
+        resolve_workflow_show_target,
+        session_has_workflow_context,
+    )
+
+    if session_has_workflow_context(memory):
+        active_id = (memory.active_workflow.id if memory.active_workflow else "").strip().lower()
+        from chat.services.platform.workflow_cancel import resolve_workflow_cancel_target
+        from chat.services.platform.workflow_show import (
+            _message_might_be_show_request,
+            resolve_workflow_show_target,
+        )
+
+        if resolve_workflow_cancel_target(message, memory, active_workflow_id=active_id):
+            return True
+        if _message_might_be_show_request(message) and resolve_workflow_show_target(
+            message, memory, active_workflow_id=active_id
+        ):
+            return True
+
+    active_id = (memory.active_workflow.id if memory.active_workflow else "").strip().lower()
+    low = (message or "").strip().lower()
+    if "expense" in low and any(tok in low for tok in ("summery", "summry", "summary", "list", "dekhao")):
+        from chat.services.platform.field_extractors.expense import message_has_new_expense_items
+
+        if not message_has_new_expense_items(message):
+            return True
+    if is_compound_expense_message(message):
+        return True
+    if is_expense_message(message) and not is_expense_draft_query(message):
+        return True
+    if is_leave_message(message) and len((message or "").split()) > 2:
+        return True
+    if active_id and is_workflow_interrupt_expense(message, active_workflow=active_id):
+        return True
+    return False
+
+
 def understanding_session_context(
     memory: SessionMemory,
     conversation_history: list[str] | tuple[str, ...] | None,
@@ -333,4 +504,7 @@ def understanding_session_context(
         ),
         "draft_field_names": list((draft.fields or {}).keys()) if draft else [],
         "draft_fields": dict(draft.fields) if draft else {},
+        "submitted_leave_ranges": list(
+            (memory.conversation_facts or {}).get("submitted_leave_ranges") or []
+        ),
     }

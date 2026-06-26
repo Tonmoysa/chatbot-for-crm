@@ -21,6 +21,39 @@ def _active_expense_memory() -> SessionMemory:
     )
 
 
+def test_new_expense_start_uses_single_expense_llm_only():
+    """'lunch 100 taka' with no active workflow must not call UNDERSTAND + expense-draft."""
+    memory = SessionMemory()
+    layer = AIUnderstandingLayer()
+    scopes: list[str] = []
+
+    with mock_expense_llm():
+        from chat.services.llm_client import LLMClient
+
+        client = LLMClient()
+
+        def _track(*, system_prompt: str, user_prompt: str, **kwargs):
+            scopes.append(str(kwargs.get("scope") or "default"))
+            assert "Understanding Layer" not in system_prompt
+            payload = json.loads(user_prompt)
+            return _mock_expense_draft_interpreter(str(payload.get("message") or ""), payload)
+
+        client.chat_json.side_effect = _track
+        result = layer.understand(
+            "lunch 100 taka",
+            memory=memory,
+            conversation_history=[],
+            trace_id="new-expense-single",
+            llm=client,
+        )
+
+    assert len(scopes) == 1
+    assert scopes[0] == "expense-draft"
+    assert result.source == "llm_expense"
+    assert result.workflow == "expense"
+    assert result.field_updates
+
+
 def test_active_expense_skips_understand_llm():
     memory = _active_expense_memory()
     layer = AIUnderstandingLayer()

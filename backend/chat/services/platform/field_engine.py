@@ -7,8 +7,10 @@ from datetime import date, datetime
 from typing import Any
 
 from chat.services.platform.field_extractors.leave import (
+    is_garbage_leave_reason_value,
     is_medical_document_skip_message,
     is_reason_skip_message,
+    is_temporal_or_request_like_leave_reason,
     merge_leave_field_dicts,
     normalize_leave_type_value,
     sanitize_leave_type_value,
@@ -510,6 +512,11 @@ class FieldEngine:
             if key == "reason" or not combined.get(key):
                 combined[key] = val
         merged = merge_leave_field_dicts({}, combined, message, memory=memory)
+        if merged.get("reason") and (
+            is_garbage_leave_reason_value(str(merged["reason"]))
+            or is_temporal_or_request_like_leave_reason(str(merged["reason"]))
+        ):
+            merged.pop("reason", None)
         from chat.services.platform.field_extractors.leave import remember_leave_narrative_seed
 
         remember_leave_narrative_seed(memory, message)
@@ -586,6 +593,63 @@ class FieldEngine:
         if result.source == "llm_expense":
             return result
 
+        from chat.services.llm_client import expense_llm_done, peek_expense_turn_cache
+
+        if expense_llm_done(trace_id or ""):
+            cached = peek_expense_turn_cache(trace_id or "")
+            if cached or (result.entities or {}).get("expense_turn"):
+                if result.workflow == "expense" and result.field_updates:
+                    return result
+                if cached and result.workflow in ("expense", ""):
+                    from chat.services.platform.field_extractors.expense import (
+                        expense_entities_for_turn,
+                        expense_turn_to_field_updates,
+                    )
+
+                    turn, updates = expense_turn_to_field_updates(
+                        message,
+                        memory,
+                        trace_id=trace_id,
+                        conversation_history=conversation_history,
+                        expense_turn=cached,
+                    )
+                    if updates or str(turn.get("intent") or "") not in ("conversation", "llm_unavailable", ""):
+                        entities = expense_entities_for_turn(
+                            dict(result.entities or {}),
+                            turn,
+                            expense_intent=str(turn.get("intent") or ""),
+                            action=str(result.action or ""),
+                        )
+                        result.entities = entities
+                        if updates:
+                            result.field_updates = updates
+                        result.workflow = "expense"
+                        return result
+
+        from chat.services.llm_client import mark_expense_llm_done
+
+        if (
+            result.source == "llm"
+            and result.workflow == "expense"
+            and result.field_updates
+            and any(
+                getattr(u, "field", None) in ("items", "incurred_date")
+                for u in result.field_updates
+            )
+        ):
+            entities = dict(result.entities or {})
+            if not entities.get("expense_intent"):
+                if any(
+                    getattr(u, "action", None) == "append" and getattr(u, "field", None) == "items"
+                    for u in result.field_updates
+                ):
+                    entities["expense_intent"] = "add"
+            entities["expense_domain_llm"] = True
+            result.entities = entities
+            if (trace_id or "").strip():
+                mark_expense_llm_done(trace_id)
+            return result
+
         from chat.services.platform.intent_rules import (
             is_clearly_off_hr_question,
             is_off_hr_topic_message,
@@ -598,6 +662,26 @@ class FieldEngine:
             or is_clearly_off_hr_question(message)
             or is_off_hr_topic_message(message, memory=memory)
         ):
+            return result
+
+        aw = memory.active_workflow if memory else None
+        goal_low = (result.goal or "").strip().lower()
+        wf = (result.workflow or "").strip().lower()
+        if aw and aw.id == "expense" and (
+            wf == "leave"
+            or result.interrupt_workflow == "leave"
+            or "leave" in goal_low
+        ):
+            return result
+
+        from chat.services.platform.intent_rules import is_greeting_or_chitchat
+
+        if is_greeting_or_chitchat(message):
+            return result
+
+        from chat.services.platform.turn_semantics import is_expense_review_request
+
+        if is_expense_review_request(message, result):
             return result
 
         if result.source == "rules":
@@ -634,7 +718,11 @@ class FieldEngine:
             memory,
             trace_id=trace_id,
             conversation_history=conversation_history,
+            expense_turn=None,
         )
+        intent = str(turn.get("intent") or "").lower()
+        if intent == "conversation" and turn.get("llm_degraded"):
+            return result
         if turn.get("off_topic"):
             result.is_out_of_scope = True
             result.workflow = "none"
@@ -644,9 +732,14 @@ class FieldEngine:
             entities.pop("expense_intent", None)
             result.entities = entities
             return result
-        intent = str(turn.get("intent") or "").lower()
-        entities = dict(result.entities or {})
-        entities["expense_intent"] = intent
+        from chat.services.platform.field_extractors.expense import expense_entities_for_turn
+
+        entities = expense_entities_for_turn(
+            dict(result.entities or {}),
+            turn,
+            expense_intent=intent,
+            action=str(result.action or ""),
+        )
         if turn.get("llm_degraded"):
             entities["expense_llm_degraded"] = True
         if turn.get("wizard_fallback"):
@@ -672,6 +765,7 @@ class FieldEngine:
             "conversation": UnderstandingAction.CLARIFICATION_NEEDED.value,
             "clarify_modify": UnderstandingAction.CLARIFICATION_NEEDED.value,
             "clarify_delete": UnderstandingAction.CLARIFICATION_NEEDED.value,
+            "llm_unavailable": UnderstandingAction.CLARIFICATION_NEEDED.value,
         }
         if intent in intent_to_action:
             result.action = intent_to_action[intent]
@@ -696,6 +790,9 @@ class FieldEngine:
             result.field_updates = []
 
         if memory.active_workflow and memory.active_workflow.id == "expense":
+            if result.interrupt_workflow == "leave":
+                result.workflow = "leave"
+                return result
             result.workflow = "expense"
             pq = memory.pending_question
             if pq and pq.workflow_id == "expense":
@@ -705,8 +802,6 @@ class FieldEngine:
                 if intent in ("show_summary", "show_list", "show_total"):
                     result.action = UnderstandingAction.REVIEW.value
                     result.answers_pending_field = False
-                if result.interrupt_workflow not in (None, "expense"):
-                    result.interrupt_workflow = None
 
         return result
 

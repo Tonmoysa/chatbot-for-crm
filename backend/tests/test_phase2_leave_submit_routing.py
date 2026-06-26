@@ -13,6 +13,7 @@ from chat.services.session_memory import (
     ActiveWorkflow,
     SessionMemory,
     StatePatchBuffer,
+    SuspendedWorkflow,
     WorkflowDraft,
 )
 from tests.helpers.pipeline_handle import handle_with_rules_understanding
@@ -143,6 +144,12 @@ def test_summary_at_submit_shows_full_review():
     assert "family" in msg.lower() or "15" in msg
 
 
+def test_contextual_cancel_phrase():
+    assert is_cancel_workflow_message("cancel it")
+    assert is_cancel_workflow_message("cancel this")
+    assert not is_cancel_workflow_message("leave summary dekhao")
+
+
 def test_cancel_at_submit_abandons_draft():
     memory = _leave_submit_memory()
     pipeline = WorkflowPipeline()
@@ -167,6 +174,54 @@ def test_cancel_at_submit_abandons_draft():
     assert "cancel" in msg.lower()
 
 
+def test_cancel_it_suspended_leave_not_summary():
+    from chat.services.pending_question_engine import informational_priority_decision
+
+    memory = SessionMemory(
+        workflow_drafts={
+            "leave": WorkflowDraft(
+                workflow_id="leave",
+                fields={"reason": "Leave tomorrow", "leave_type": "sick"},
+            ),
+        },
+        suspended_workflows=[
+            SuspendedWorkflow(
+                workflow_id="leave",
+                stage="collecting",
+                draft_id="leave",
+                suspended_at_turn=1,
+            ),
+        ],
+    )
+    decision = informational_priority_decision(
+        "cancel it",
+        memory=memory,
+        conversation_history=["Assistant: **Chuti saransho**\n\nStatus: Pending"],
+    )
+    assert decision is not None
+    assert decision.kind == MessageIntentKind.CANCEL_WORKFLOW
+    assert decision.target_workflow == "leave"
+
+    pipeline = WorkflowPipeline()
+    msg, meta = handle_with_rules_understanding(
+        pipeline,
+        "cancel it",
+        memory=memory,
+        pq_decision=decision,
+        trace_id="phase2-cancel-it-suspended",
+        route_source="pending",
+        understanding=UnderstandingResult(
+            workflow="leave",
+            action=UnderstandingAction.CANCEL.value,
+            entities={"cancel_workflow_target": "leave"},
+            confidence=0.92,
+        ),
+    )
+    assert meta.get("outcome") == "CANCELLED"
+    assert memory.workflow_drafts.get("leave") is None
+    assert "cancel" in msg.lower()
+
+
 def test_post_cancel_summary_no_submit_error():
     memory = SessionMemory()
     pipeline = WorkflowPipeline()
@@ -185,7 +240,13 @@ def test_post_cancel_summary_no_submit_error():
         pq_decision=pq,
         trace_id="phase2-post-cancel-summary",
     )
-    assert "active leave" in msg.lower() or "no " in msg.lower() or "draft" in msg.lower()
+    assert (
+        "active leave" in msg.lower()
+        or "no " in msg.lower()
+        or "draft" in msg.lower()
+        or "couldn't find" in msg.lower()
+        or "khuje pacchi nah" in msg.lower()
+    )
     assert meta.get("outcome") == "INFORMATIONAL"
 
 

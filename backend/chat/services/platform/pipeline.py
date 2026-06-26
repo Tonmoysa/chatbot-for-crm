@@ -184,6 +184,11 @@ class PlanBuilder:
     def is_leave_turn(ctx: TurnContext, decision: TurnDecision) -> bool:
         u = decision.understanding
         pq = decision.pq
+        message = ctx.user_message or ""
+        from chat.services.platform.turn_semantics import is_expense_review_request
+
+        if is_expense_review_request(message, u):
+            return False
         if ctx.active_workflow_id == "leave":
             return True
         if ctx.pending_question_workflow_id == "leave":
@@ -202,6 +207,12 @@ class PlanBuilder:
     def is_expense_turn(ctx: TurnContext, decision: TurnDecision) -> bool:
         u = decision.understanding
         pq = decision.pq
+        if PlanBuilder.is_leave_turn(ctx, decision):
+            return False
+        if u and u.interrupt_workflow == "leave":
+            return False
+        if pq and pq.kind == MessageIntentKind.SWITCH_WORKFLOW and pq.target_workflow == "leave":
+            return False
         if ctx.active_workflow_id == "expense":
             return True
         if ctx.pending_question_workflow_id == "expense":
@@ -228,6 +239,46 @@ class PlanBuilder:
         if PlanBuilder.is_expense_turn(ctx, decision):
             return False
         return True
+
+    @staticmethod
+    def _is_new_expense_claim(
+        message: str,
+        understanding: UnderstandingResult | None = None,
+        *,
+        active_workflow_id: str | None = None,
+    ) -> bool:
+        from chat.services.platform.intent_rules import (
+            is_compound_expense_message,
+            is_expense_draft_query,
+            is_expense_message,
+        )
+
+        active = (active_workflow_id or "").strip().lower()
+        if active == "expense":
+            return False
+        if is_expense_draft_query(message):
+            return False
+        u = understanding
+        if u and (u.entities or {}).get("expense_new_claim"):
+            return True
+        if u and u.field_updates:
+            return True
+        expense_turn = dict((u.entities or {}).get("expense_turn") or {}) if u else {}
+        if expense_turn.get("item_patches"):
+            return True
+        return is_compound_expense_message(message) or (
+            is_expense_message(message) and not is_expense_draft_query(message)
+        )
+
+    @staticmethod
+    def _prepare_fresh_expense_draft(state: StatePatchBuffer, memory: SessionMemory) -> None:
+        for draft_id in ("expense", "default"):
+            draft = (memory.workflow_drafts or {}).get(draft_id)
+            if draft and draft.workflow_id == "expense":
+                state.push("clear_draft_fields", draft_id=draft_id)
+        state.push("drop_suspended_workflow", value="expense")
+        state.push("clear_pending_confirmation")
+        state.push("clear_pending_question")
 
     @classmethod
     def _suspended_expense_list_plan(cls, ctx: TurnContext, *, reason: str) -> ExecutionPlan:
@@ -398,15 +449,10 @@ class PlanBuilder:
                     reason="understanding out of scope",
                     workflow_id=INFORMATIONAL_WORKFLOW_ID,
                 )
-            if (
-                u.is_greeting
-                and not ctx.has_active_workflow
-                and not ctx.has_pending_question
-                and not str(ctx.pending_confirmation or "").startswith("switch:")
-            ):
+            if u.is_greeting:
                 return ExecutionPlan(
                     ops=[PlanOp.REPLY_GREETING],
-                    reason="greeting",
+                    reason="greeting during any session state",
                     workflow_id=INFORMATIONAL_WORKFLOW_ID,
                 )
 
@@ -511,7 +557,7 @@ class PlanBuilder:
 
         if should_route_expense_after_submitted_leave(
             draft_locked=True,
-            active_workflow_id="leave",
+            active_workflow_id=ctx.active_workflow_id,
             message=message,
             understanding=u,
             pq_target_workflow=(pq.target_workflow if pq else None),
@@ -616,6 +662,16 @@ class PlanBuilder:
         u = decision.understanding
         message = ctx.user_message or ""
         pq = decision.pq
+        from chat.services.platform.turn_semantics import is_expense_review_request
+
+        if is_expense_review_request(message, u) or (
+            pq and pq.kind == MessageIntentKind.SHOW_REVIEW and pq.target_workflow == "expense"
+        ):
+            return ExecutionPlan(
+                ops=[PlanOp.WORKFLOW_SHOW_REVIEW],
+                reason="expense summary on submitted draft",
+                workflow_id=workflow_id,
+            )
 
         if u and u.action in (
             UnderstandingAction.MODIFY.value,
@@ -678,6 +734,7 @@ class PlanBuilder:
         if u and u.field_updates and u.action in (
             UnderstandingAction.START.value,
             UnderstandingAction.COLLECT.value,
+            UnderstandingAction.MODIFY.value,
         ):
             ops.append(PlanOp.WORKFLOW_APPLY_UPDATES)
         return ExecutionPlan(
@@ -850,6 +907,21 @@ class PlanBuilder:
             or u.action == UnderstandingAction.REVIEW.value
             or is_resume_workflow_request(message, workflow_id=workflow_id)
         ) and not is_clearly_off_hr_question(message):
+            from chat.services.platform.workflow_show import resolve_workflow_show_target
+
+            show_target = str((u.entities or {}).get("show_workflow_target") or "").lower()
+            if not show_target:
+                show_target = resolve_workflow_show_target(
+                    message,
+                    None,
+                    active_workflow_id=workflow_id,
+                ) or ""
+            if show_target == "leave":
+                return ExecutionPlan(
+                    ops=[PlanOp.WORKFLOW_SHOW_REVIEW],
+                    reason="leave summary during expense submit review",
+                    workflow_id="leave",
+                )
             if is_bare_rejection(message):
                 return ExecutionPlan(
                     ops=[PlanOp.RESOLVE_SUBMIT_CONFIRMATION],
@@ -875,10 +947,37 @@ class PlanBuilder:
                 workflow_id=workflow_id,
             )
 
+        from chat.services.platform.intent_rules import is_bare_confirmation
+
+        if (
+            is_bare_confirmation(message)
+            or u.action in (
+                UnderstandingAction.CONFIRM.value,
+                UnderstandingAction.SUBMIT.value,
+            )
+            or (
+                pq
+                and pq.kind == MessageIntentKind.ANSWER_PENDING
+                and is_bare_confirmation(message)
+            )
+        ):
+            return ExecutionPlan(
+                ops=[PlanOp.RESOLVE_SUBMIT_CONFIRMATION],
+                reason="submit confirmation yes",
+                workflow_id=workflow_id,
+            )
+
         if (
             (pq and pq.kind == MessageIntentKind.CLARIFICATION_NEEDED)
             or u.action == UnderstandingAction.CLARIFICATION_NEEDED.value
         ):
+            expense_intent = str((u.entities or {}).get("expense_intent") or "").lower()
+            if workflow_id == "expense" and expense_intent in ("clarify_delete", "clarify_modify"):
+                return ExecutionPlan(
+                    ops=[PlanOp.WORKFLOW_COLLECT],
+                    reason="expense edit clarification during submit review",
+                    workflow_id=workflow_id,
+                )
             return ExecutionPlan(
                 ops=[PlanOp.WORKFLOW_CLARIFICATION],
                 reason="clarify during submit review",
@@ -939,6 +1038,19 @@ class PlanBuilder:
             )
 
         if kind == MessageIntentKind.ANSWER_PENDING:
+            expense_intent = str((u.entities or {}).get("expense_intent") or "").lower()
+            if (
+                workflow_id == "expense"
+                and expense_intent == "add"
+                and u.field_updates
+                and not ctx.pending_question_field
+                and active_id != "expense"
+            ):
+                return ExecutionPlan(
+                    ops=[PlanOp.WORKFLOW_NEW, PlanOp.WORKFLOW_APPLY_UPDATES],
+                    reason="new expense claim with line items",
+                    workflow_id="expense",
+                )
             ops: list[PlanOp] = [PlanOp.MAYBE_WORKFLOW_SWITCH, PlanOp.WORKFLOW_COLLECT]
             if workflow_id == "leave":
                 ops = [PlanOp.MAYBE_DUPLICATE_LEAVE, *ops]
@@ -960,6 +1072,19 @@ class PlanBuilder:
                 workflow_id=workflow_id,
             )
         if kind == MessageIntentKind.SWITCH_WORKFLOW:
+            if (
+                target
+                and active_id
+                and target != active_id
+                and target in suspended_ids
+                and target == "expense"
+                and cls._is_new_expense_claim(ctx.user_message or "", u, active_workflow_id=active_id)
+            ):
+                return ExecutionPlan(
+                    ops=[PlanOp.WORKFLOW_NEW, PlanOp.WORKFLOW_APPLY_UPDATES],
+                    reason="new expense claim replaces suspended draft",
+                    workflow_id="expense",
+                )
             if target and active_id and target != active_id and target in suspended_ids:
                 return ExecutionPlan(
                     ops=[PlanOp.WORKFLOW_SWITCH],
@@ -973,14 +1098,23 @@ class PlanBuilder:
             )
         if kind == MessageIntentKind.NEW_WORKFLOW and pq and not pq.blocks_new_workflow:
             ops = [PlanOp.WORKFLOW_NEW]
+            if u.field_updates and workflow_id in ("expense", "leave"):
+                ops.append(PlanOp.WORKFLOW_APPLY_UPDATES)
             if workflow_id == "leave":
-                ops = [PlanOp.MAYBE_DUPLICATE_LEAVE, PlanOp.WORKFLOW_NEW]
+                ops = [PlanOp.MAYBE_DUPLICATE_LEAVE, *ops]
             return ExecutionPlan(
                 ops=ops,
                 reason=f"start {workflow_id} workflow",
                 workflow_id=workflow_id,
             )
         if kind == MessageIntentKind.CLARIFICATION_NEEDED:
+            expense_intent = str((u.entities or {}).get("expense_intent") or "").lower()
+            if workflow_id == "expense" and expense_intent in ("clarify_delete", "clarify_modify"):
+                return ExecutionPlan(
+                    ops=[PlanOp.WORKFLOW_COLLECT],
+                    reason="expense edit clarification",
+                    workflow_id=workflow_id,
+                )
             return ExecutionPlan(
                 ops=[PlanOp.WORKFLOW_CLARIFICATION],
                 reason="needs clarification",
@@ -1011,14 +1145,35 @@ class PlanBuilder:
                 workflow_id=workflow_id,
             )
 
+        if (pq and pq.kind == MessageIntentKind.DELETE_DATA) or u.action == UnderstandingAction.DELETE.value:
+            return ExecutionPlan(
+                ops=[PlanOp.WORKFLOW_DELETE],
+                reason="delete from active draft",
+                workflow_id=workflow_id,
+            )
+
         if (pq and pq.kind == MessageIntentKind.SHOW_REVIEW) or u.action == UnderstandingAction.REVIEW.value:
             from chat.services.platform.intent_rules import is_clearly_off_hr_question, is_programming_question
+            from chat.services.platform.workflow_show import resolve_workflow_show_target
 
             if is_programming_question(message or "") or is_clearly_off_hr_question(message or ""):
                 return ExecutionPlan(
                     ops=[PlanOp.REJECT_OOS],
                     reason="off-hr topic during active workflow",
                     workflow_id=workflow_id,
+                )
+            show_target = str((u.entities or {}).get("show_workflow_target") or "").lower()
+            if not show_target:
+                show_target = resolve_workflow_show_target(
+                    message,
+                    None,
+                    active_workflow_id=workflow_id,
+                ) or ""
+            if show_target == "leave":
+                return ExecutionPlan(
+                    ops=[PlanOp.WORKFLOW_SHOW_REVIEW],
+                    reason="leave summary during active expense",
+                    workflow_id="leave",
                 )
             if cls._wants_suspended_expense_list(ctx, message or ""):
                 return cls._suspended_expense_list_plan(
@@ -1108,10 +1263,6 @@ class PlanBuilder:
 
         if pending == "submit" and workflow_id == "expense":
             intent = str((u.entities or {}).get("expense_intent") or "").lower()
-            from chat.services.platform.intent_rules import (
-                is_compound_expense_message,
-                is_expense_message,
-            )
 
             if intent in (
                 "add",
@@ -1191,6 +1342,14 @@ class PlanBuilder:
             and switch_target in suspended_ids
             and not cls._is_expense_review_edit(ctx, u, message)
         ):
+            if switch_target == "expense" and cls._is_new_expense_claim(
+                message or "", u, active_workflow_id=active_id
+            ):
+                return ExecutionPlan(
+                    ops=[PlanOp.WORKFLOW_NEW, PlanOp.WORKFLOW_APPLY_UPDATES],
+                    reason="new expense claim replaces suspended draft",
+                    workflow_id="expense",
+                )
             return ExecutionPlan(
                 ops=[PlanOp.WORKFLOW_SWITCH],
                 reason=f"resume suspended {switch_target}",
@@ -1235,7 +1394,7 @@ class PlanBuilder:
                 )
             )
             if expense_signal and not is_pure_expense_navigation(message):
-                if u.field_updates:
+                if u.field_updates and expense_intent not in ("delete", "clarify_delete"):
                     return ExecutionPlan(
                         ops=[PlanOp.WORKFLOW_APPLY_UPDATES],
                         reason="apply expense field updates",
@@ -1279,6 +1438,9 @@ class PlanBuilder:
 
 class WorkflowPipeline:
     """Plan-first workflow executor: PlanBuilder → execute_plan → StatePatchBuffer → apply_state_patches."""
+
+    _is_new_expense_claim = staticmethod(PlanBuilder._is_new_expense_claim)
+    _prepare_fresh_expense_draft = staticmethod(PlanBuilder._prepare_fresh_expense_draft)
 
     @staticmethod
     def _require_turn_context(
@@ -1547,6 +1709,21 @@ class WorkflowPipeline:
                 state.push("merge_last_entities", value={"leave_start_clarify": True})
             elif memory.active_workflow and draft:
                 state.push("merge_last_entities", value={"leave_start_clarify": False})
+            expense_intent = str((understanding.entities or {}).get("expense_intent") or "").lower()
+            if (
+                memory.active_workflow
+                and memory.active_workflow.id == "expense"
+                and expense_intent in ("clarify_delete", "clarify_modify")
+            ):
+                turn = dict((understanding.entities or {}).get("expense_turn") or {})
+                turn.setdefault("intent", expense_intent)
+                body = self.composer.expense_edit_clarify(memory, turn, lang=lang)
+                return body, {
+                    "outcome": "NEEDS_CLARIFICATION",
+                    "reason": understanding.reasoning if understanding else "",
+                    "understanding": understanding.to_dict() if understanding else {},
+                    "rules_applied": ["EXPENSE_EDIT_CLARIFY"],
+                }
             return self.composer.clarification(
                 understanding, lang=lang, draft=draft, memory=memory
             ), {
@@ -1555,7 +1732,14 @@ class WorkflowPipeline:
                 "understanding": understanding.to_dict() if understanding else {},
             }
         if op == PlanOp.WORKFLOW_SHOW_REVIEW:
+            show_target = str((understanding.entities or {}).get("show_workflow_target") or wf_id or "").lower()
             defn = get_workflow_definition(wf_id) or self._active_defn(memory)
+            if show_target == "leave" or (defn and defn.workflow_id == "leave"):
+                body = self.composer.leave_status_report(memory, lang=lang)
+                return body, {
+                    "outcome": "INFORMATIONAL",
+                    "rules_applied": ["LEAVE_SESSION_SUMMARY"],
+                }
             if defn:
                 return self._show_review(memory, defn, lang=lang, state=state)
             return None
@@ -1597,9 +1781,18 @@ class WorkflowPipeline:
                         filter_expense_updates_for_review,
                     )
 
-                    updates = filter_expense_updates_for_review(
-                        updates, message, memory=memory, trace_id=trace_id
-                    )
+                    expense_turn = dict((understanding.entities or {}).get("expense_turn") or {})
+                    expense_intent = str((understanding.entities or {}).get("expense_intent") or "").lower()
+                    if expense_intent == "clarify_delete":
+                        updates = []
+                    else:
+                        updates = filter_expense_updates_for_review(
+                            updates,
+                            message,
+                            memory=memory,
+                            trace_id=trace_id,
+                            expense_turn=expense_turn,
+                        )
                 if not updates:
                     return None
                 if not was_submit:
@@ -1642,7 +1835,13 @@ class WorkflowPipeline:
                 return self._continue_collection(memory, defn, lang=lang, prefix=prefix, state=state)
             return None
         if op == PlanOp.WORKFLOW_CANCEL:
-            return self._handle_workflow_cancel(memory, lang=lang, state=state)
+            return self._handle_workflow_cancel(
+                memory,
+                lang=lang,
+                state=state,
+                understanding=understanding,
+                pq_decision=pq_decision,
+            )
         return None
 
     def _handle_workflow_cancel(
@@ -1651,9 +1850,28 @@ class WorkflowPipeline:
         *,
         lang: str,
         state: StatePatchBuffer,
+        understanding: UnderstandingResult | None = None,
+        pq_decision=None,
     ) -> tuple[str, dict[str, Any]]:
-        wf_id = memory.active_workflow.id if memory.active_workflow else "workflow"
-        state.push("cancel_active_workflow")
+        target = ""
+        if understanding is not None:
+            target = str((understanding.entities or {}).get("cancel_workflow_target") or "").strip().lower()
+            if not target:
+                target = str(understanding.workflow or "").strip().lower()
+        if not target and pq_decision is not None:
+            target = str(getattr(pq_decision, "target_workflow", None) or "").strip().lower()
+
+        aw = memory.active_workflow
+        if aw and (not target or target == aw.id):
+            state.push("cancel_active_workflow")
+            wf_id = aw.id
+        elif target in ("leave", "expense"):
+            state.push("cancel_workflow_draft", value=target)
+            wf_id = target
+        else:
+            state.push("cancel_active_workflow")
+            wf_id = aw.id if aw else "workflow"
+
         msg = self.composer.workflow_cancelled(wf_id, lang=lang)
         return msg, {
             "outcome": "CANCELLED",
@@ -2097,7 +2315,38 @@ class WorkflowPipeline:
         state: StatePatchBuffer,
     ) -> tuple[str, dict[str, Any]]:
         u = understanding
-        state.push("merge_last_entities", value={"turn_understanding": u.to_dict(), "leave_start_clarify": False})
+        from chat.services.platform.field_extractors.expense import expense_entities_for_turn
+
+        wf_id_early = (u.workflow or "").strip().lower()
+        if wf_id_early == "expense" and self._is_new_expense_claim(
+            message,
+            u,
+            active_workflow_id=(memory.active_workflow.id if memory.active_workflow else ""),
+        ):
+            self._prepare_fresh_expense_draft(state, memory)
+
+        expense_entity_patch: dict[str, Any] = {}
+        if (u.workflow or "").strip().lower() == "expense":
+            if isinstance((u.entities or {}).get("expense_turn"), dict):
+                expense_entity_patch = expense_entities_for_turn(
+                    dict(memory.last_entities or {}),
+                    (u.entities or {}).get("expense_turn"),
+                    expense_intent=str((u.entities or {}).get("expense_intent") or ""),
+                    action=str(u.action or ""),
+                )
+            else:
+                expense_entity_patch = expense_entities_for_turn(
+                    dict(memory.last_entities or {}),
+                    None,
+                )
+        state.push(
+            "merge_last_entities",
+            value={
+                "turn_understanding": u.to_dict(),
+                "leave_start_clarify": False,
+                **expense_entity_patch,
+            },
+        )
 
         if u.is_out_of_scope:
             self._pause_for_oos(state)
@@ -2105,6 +2354,29 @@ class WorkflowPipeline:
 
         if u.action == UnderstandingAction.CLARIFICATION_NEEDED.value:
             draft = memory.active_draft()
+            wf_id = (u.workflow or "").strip().lower()
+            if (
+                wf_id == "expense"
+                and draft
+                and draft.locked
+                and draft.workflow_id == "leave"
+            ):
+                state.push(
+                    "merge_last_entities",
+                    value={
+                        "last_expense_clarify_message": message,
+                        "leave_start_clarify": False,
+                    },
+                )
+                interrupted = self._maybe_workflow_switch_confirm(
+                    message,
+                    memory,
+                    lang,
+                    understanding=u,
+                    state=state,
+                )
+                if interrupted:
+                    return interrupted
             return self.composer.clarification(u, lang=lang, draft=draft), {
                 "outcome": "NEEDS_CLARIFICATION",
                 "reason": u.reasoning,
@@ -2172,6 +2444,26 @@ class WorkflowPipeline:
             return blocked
 
         if u.field_updates:
+            if wf_id == "expense":
+                from chat.services.platform.intent_rules import parse_submit_workflow
+
+                was_submit = bool(
+                    parse_submit_workflow(message, active_workflow_id=wf_id)
+                    or (u.entities or {}).get("submit_after_edit")
+                )
+                return self._finish_expense_update_turn(
+                    memory,
+                    defn,
+                    updates=list(u.field_updates),
+                    message=message,
+                    lang=lang,
+                    state=state,
+                    was_submit=was_submit,
+                    rules_applied=["EXPENSE_NEW_CLAIM"],
+                    conversation_history=conversation_history,
+                    trace_id=trace_id,
+                    understanding=u,
+                )
             state.apply_field_updates(u.field_updates, message=message)
             self._push_default_expense_date(state, memory)
             state.push("clear_pending_confirmation")
@@ -2195,9 +2487,12 @@ class WorkflowPipeline:
     ) -> tuple[str, dict[str, Any]]:
         """Expense draft editor — intent-first, LLM patches, pending queue."""
         from chat.services.platform.field_extractors.expense import (
+            expense_turn_has_targeted_patches,
+            expense_turn_llm_blocked,
             is_expense_ambiguous_ack,
             is_expense_category_unknown_decline,
             is_expense_collect_complaint,
+            is_expense_draft_mutation_message,
             sync_expense_draft,
         )
         from chat.services.platform.response_composer import localized
@@ -2209,9 +2504,150 @@ class WorkflowPipeline:
 
         u = understanding
         intent = str((u.entities or {}).get("expense_intent") or "").lower()
+        expense_turn = dict((u.entities or {}).get("expense_turn") or {})
         draft = memory.active_draft()
+
+        active_id = memory.active_workflow.id if memory.active_workflow else "expense"
+        from chat.services.platform.field_extractors.expense import (
+            expense_message_requests_submit,
+            clear_expense_blocked_add,
+        )
+
+        if expense_message_requests_submit(message, active_workflow_id=active_id):
+            clear_expense_blocked_add(memory)
+            return self._request_submit(memory, defn, lang=lang, state=state)
+
+        from chat.services.platform.field_extractors.expense import (
+            interpret_expense_turn_semantics,
+        )
+
+        sem = interpret_expense_turn_semantics(
+            message,
+            memory,
+            expense_turn,
+            trace_id=trace_id,
+            conversation_history=conversation_history,
+        )
+        if (
+            not sem.get("replay_blocked_add")
+            and not sem.get("date_correction")
+            and (
+                intent == "date_not_allowed"
+                or expense_turn.get("date_policy_rejected")
+            )
+        ):
+            requested = expense_turn.get("rejected_incurred_date")
+            body = self.composer.expense_date_policy_blocked(
+                lang=lang,
+                requested_date=str(requested) if requested else None,
+            )
+            return self._continue_collection(
+                memory,
+                defn,
+                lang=lang,
+                prefix=body,
+                state=state,
+                extra_rules=["EXPENSE_DATE_TODAY_ONLY"],
+            )
+
         pq_slot = memory.pending_question
-        was_submit = memory.pending_confirmation == "submit"
+        from chat.services.platform.intent_rules import parse_submit_workflow
+        from chat.services.platform.field_extractors.expense import message_requests_submit_after_edit
+
+        active_id = memory.active_workflow.id if memory.active_workflow else "expense"
+        was_submit = memory.pending_confirmation == "submit" or bool(
+            parse_submit_workflow(message, active_workflow_id=active_id)
+            or message_requests_submit_after_edit(message, active_workflow_id=active_id)
+        )
+
+        from chat.services.platform.intent_rules import is_bare_confirmation
+
+        if (
+            pq_slot
+            and pq_slot.workflow_id == "expense"
+            and is_bare_confirmation(message)
+            and pq_slot.field == "item_route"
+        ):
+            body = self.composer.slot_still_needed(
+                pq_slot.field,
+                pq_slot.prompt or "",
+                lang=lang,
+            )
+            return body, {
+                "outcome": "NEEDS_INPUT",
+                "rules_applied": ["EXPENSE_ROUTE_NEEDED"],
+            }
+
+        if intent == "repeat_ack":
+            prefix_parts = [self.composer.expense_already_recorded(lang=lang)]
+            if expense_turn.get("past_date_rejected"):
+                prefix_parts.insert(0, self.composer.expense_past_date_policy(lang=lang))
+            prefix = "\n\n".join(prefix_parts)
+            return self._continue_collection(
+                memory, defn, lang=lang, prefix=prefix, state=state
+            )
+
+        if intent == "llm_unavailable" or expense_turn_llm_blocked(expense_turn, memory):
+            from chat.services.platform.field_extractors.expense import (
+                _try_wizard_fallback_turn,
+                expense_turn_to_field_updates,
+            )
+
+            wizard = _try_wizard_fallback_turn(message, memory)
+            if wizard and wizard.get("item_patches"):
+                _, wizard_updates = expense_turn_to_field_updates(
+                    message,
+                    memory,
+                    trace_id=trace_id,
+                    conversation_history=conversation_history,
+                    expense_turn=wizard,
+                )
+                if wizard_updates:
+                    wizard_updates = _review_safe_updates(wizard_updates)
+                    if wizard_updates:
+                        state.apply_field_updates(wizard_updates, message=message)
+                        self._push_default_expense_date(state, memory)
+                        sync_expense_draft(memory.active_draft())
+                        from chat.services.platform.intent_rules import parse_submit_workflow
+
+                        active_id = memory.active_workflow.id if memory.active_workflow else "expense"
+                        if parse_submit_workflow(message, active_workflow_id=active_id):
+                            return self._maybe_submit(
+                                memory,
+                                defn,
+                                UnderstandingResult(
+                                    goal="Submit expense",
+                                    workflow="expense",
+                                    action=UnderstandingAction.CONFIRM.value,
+                                    confidence=0.9,
+                                    reasoning="Submit after wizard expense edit.",
+                                    source="wizard",
+                                ),
+                                lang=lang,
+                                company_id="",
+                                employee_id="",
+                                session_id="",
+                                idempotency_key="",
+                                state=state,
+                            )
+                        prefix = self.composer.item_prefix_from_updates(wizard_updates, lang=lang)
+                        return self._continue_collection(
+                            memory, defn, lang=lang, prefix=prefix, state=state
+                        )
+
+            body = self.composer.expense_llm_unavailable(lang=lang, for_edit=True)
+            if was_submit and draft:
+                sync_expense_draft(draft)
+                review_text, _ = self.review.prepare_review(memory, defn, lang=lang)
+                if review_text:
+                    body = f"{body}\n\n{review_text}".strip()
+            return body, {
+                "outcome": "NEEDS_INPUT",
+                "rules_applied": ["EXPENSE_LLM_UNAVAILABLE"],
+                "awaiting_confirmation": was_submit,
+            }
+
+        draft = memory.active_draft()
 
         def _review_safe_updates(raw_updates: list) -> list:
             if not was_submit:
@@ -2225,6 +2661,7 @@ class WorkflowPipeline:
                 message,
                 memory=memory,
                 trace_id=trace_id,
+                expense_turn=dict((u.entities or {}).get("expense_turn") or {}),
             )
 
         from chat.services.platform.intent_rules import (
@@ -2244,6 +2681,47 @@ class WorkflowPipeline:
                 "outcome": "CANCELLED",
                 "rules_applied": ["EXPENSE_CANCEL"],
             }
+
+        from chat.services.platform.field_extractors.expense import (
+            expense_turn_to_field_updates,
+            pending_expense_edit_active,
+            resolve_pending_expense_edit_turn,
+        )
+
+        if pending_expense_edit_active(memory):
+            resolved = resolve_pending_expense_edit_turn(message, memory)
+            if resolved and (
+                resolved.get("item_patches") or resolved.get("delete_indices")
+            ):
+                state.push("merge_last_entities", value={"expense_pending_edit": None})
+                state.push("clear_pending_question")
+                _, patch_updates = expense_turn_to_field_updates(
+                    message,
+                    memory,
+                    trace_id=trace_id,
+                    conversation_history=conversation_history,
+                    expense_turn=resolved,
+                )
+                if patch_updates:
+                    resolved_intent = str(resolved.get("intent") or "").lower()
+                    rules = ["EXPENSE_PENDING_EDIT_RESOLVE"]
+                    if resolved_intent == "delete":
+                        rules = ["EXPENSE_RULES_DELETE"]
+                    elif resolved_intent in ("modify_review", "update", "correct"):
+                        rules = ["EXPENSE_RULES_MODIFY"]
+                    return self._finish_expense_update_turn(
+                        memory,
+                        defn,
+                        updates=_review_safe_updates(list(patch_updates)),
+                        message=message,
+                        lang=lang,
+                        state=state,
+                        was_submit=was_submit,
+                        rules_applied=rules,
+                        conversation_history=conversation_history,
+                        trace_id=trace_id,
+                        understanding=u,
+                    )
 
         from chat.services.platform.field_extractors.expense import coerce_pending_expense_turn
 
@@ -2275,31 +2753,44 @@ class WorkflowPipeline:
                 )
 
         if u.action == UnderstandingAction.DELETE.value and u.targets:
-            idx = u.targets[0].item_index
-            if idx is not None:
-                return self._finish_expense_update_turn(
-                    memory,
-                    defn,
-                    updates=[
-                        FieldUpdate(
-                            field="items",
-                            value={},
-                            item_index=idx,
-                            action="delete",
-                        )
-                    ],
-                    message=message,
-                    lang=lang,
-                    state=state,
-                    rules_applied=["EXPENSE_RULES_DELETE"],
-                    conversation_history=conversation_history,
-                    trace_id=trace_id,
-                    understanding=u,
+            delete_updates = [
+                FieldUpdate(
+                    field="items",
+                    value={},
+                    item_index=t.item_index,
+                    action="delete",
                 )
+                for t in u.targets
+                if t.item_index is not None
+            ]
+            if not delete_updates:
+                delete_updates = [
+                    FieldUpdate(
+                        field="items",
+                        value={},
+                        item_index=u.targets[0].item_index,
+                        action="delete",
+                    )
+                ]
+            from chat.services.platform.field_extractors.expense import clear_expense_blocked_add
+
+            clear_expense_blocked_add(memory)
+            return self._finish_expense_update_turn(
+                memory,
+                defn,
+                updates=delete_updates,
+                message=message,
+                lang=lang,
+                state=state,
+                rules_applied=["EXPENSE_RULES_DELETE"],
+                conversation_history=conversation_history,
+                trace_id=trace_id,
+                understanding=u,
+            )
 
         if draft and is_delete_request(message) and not parse_route(message):
             parsed_del = parse_delete_request(message, list(draft.fields.get("items") or []))
-            if parsed_del:
+            if parsed_del and parsed_del.get("item_index") is not None:
                 return self._finish_expense_update_turn(
                     memory,
                     defn,
@@ -2319,10 +2810,39 @@ class WorkflowPipeline:
                     trace_id=trace_id,
                     understanding=u,
                 )
+            if parsed_del and parsed_del.get("needs_clarify"):
+                turn = {
+                    "intent": "clarify_delete",
+                    "item_patches": [],
+                    "clarify": {
+                        "kind": "which_delete",
+                        "candidate_indices": list(parsed_del.get("candidate_indices") or []),
+                        "category": parsed_del.get("category") or parsed_del.get("label"),
+                    },
+                }
+                from chat.services.platform.field_extractors.expense import (
+                    build_expense_pending_edit_from_turn,
+                )
+
+                pending_edit = build_expense_pending_edit_from_turn(turn, message=message, memory=memory)
+                if pending_edit:
+                    state.push("merge_last_entities", value={"expense_pending_edit": pending_edit})
+                body = self.composer.expense_edit_clarify(memory, turn, lang=lang)
+                return body, {
+                    "outcome": "NEEDS_CLARIFICATION",
+                    "rules_applied": ["EXPENSE_DELETE_CLARIFY"],
+                }
             if is_vague_delete(message) or (
                 is_delete_request(message) and not looks_like_expense_item_delete(message)
             ):
                 turn = {"intent": "clarify_delete", "item_patches": []}
+                from chat.services.platform.field_extractors.expense import (
+                    build_expense_pending_edit_from_turn,
+                )
+
+                pending_edit = build_expense_pending_edit_from_turn(turn, message=message, memory=memory)
+                if pending_edit:
+                    state.push("merge_last_entities", value={"expense_pending_edit": pending_edit})
                 body = self.composer.expense_edit_clarify(memory, turn, lang=lang)
                 return body, {
                     "outcome": "NEEDS_CLARIFICATION",
@@ -2344,7 +2864,37 @@ class WorkflowPipeline:
                 understanding=u,
             )
 
-        if draft and is_modify_request(message):
+        expense_turn_ready = bool(
+            u.field_updates
+            and (
+                expense_turn.get("llm_used")
+                or u.source == "llm_expense"
+                or (u.entities or {}).get("expense_domain_llm")
+            )
+            and intent in ("add", "answer_pending", "")
+        )
+        from chat.services.platform.field_extractors.expense import message_has_new_expense_items
+
+        if (
+            draft
+            and is_modify_request(message)
+            and not expense_turn_ready
+            and not message_has_new_expense_items(message)
+        ):
+            from chat.services.platform.field_extractors.expense import _llm_client_configured
+
+            if _llm_client_configured() or is_expense_draft_mutation_message(message, memory):
+                body = self.composer.expense_llm_unavailable(lang=lang, for_edit=True)
+                if was_submit and draft:
+                    sync_expense_draft(draft)
+                    review_text, _ = self.review.prepare_review(memory, defn, lang=lang)
+                    if review_text:
+                        body = f"{body}\n\n{review_text}".strip()
+                return body, {
+                    "outcome": "NEEDS_INPUT",
+                    "rules_applied": ["EXPENSE_LLM_UNAVAILABLE"],
+                    "awaiting_confirmation": was_submit,
+                }
             parsed = parse_modify_request(message, list(draft.fields.get("items") or []))
             if parsed and parsed.get("needs_clarify"):
                 turn = {
@@ -2388,14 +2938,21 @@ class WorkflowPipeline:
 
         if not u.field_updates and (
             is_expense_message(message) or is_compound_expense_message(message)
-        ):
-            from chat.services.platform.field_extractors.expense import expense_turn_to_field_updates
+        ) and not (pending_expense_edit_active(memory) and intent != "add"):
+            from chat.services.platform.field_extractors.expense import (
+                coerce_expense_correction_turn,
+                expense_turn_to_field_updates,
+            )
 
+            expense_turn = dict((u.entities or {}).get("expense_turn") or {})
+            if expense_turn.get("item_patches"):
+                expense_turn = coerce_expense_correction_turn(expense_turn, memory)
             _, retry_updates = expense_turn_to_field_updates(
                 message,
                 memory,
                 trace_id=trace_id,
                 conversation_history=conversation_history,
+                expense_turn=expense_turn if expense_turn.get("item_patches") else None,
             )
             if retry_updates:
                 return self._finish_expense_update_turn(
@@ -2446,7 +3003,9 @@ class WorkflowPipeline:
                 sync_expense_draft(draft)
             turn = dict(u.entities.get("expense_turn") or {})
             turn.setdefault("intent", intent)
-            pending_edit = build_expense_pending_edit_from_turn(turn, message=message)
+            pending_edit = build_expense_pending_edit_from_turn(
+                turn, message=message, memory=memory
+            )
             if pending_edit:
                 state.push("merge_last_entities", value={"expense_pending_edit": pending_edit})
             body = self.composer.expense_edit_clarify(memory, turn, lang=lang)
@@ -2540,14 +3099,19 @@ class WorkflowPipeline:
         if u.action == UnderstandingAction.CONFIRM.value or intent == "confirm":
             return self._request_submit(memory, defn, lang=lang, state=state)
 
-        if u.field_updates:
+        if u.field_updates and (
+            intent in ("date_correction", "replay_blocked_add")
+            or intent not in ("delete", "clarify_delete", "date_not_allowed")
+        ):
             entities = dict(memory.last_entities or {})
             entities["expense_pending_intent"] = intent
             memory.last_entities = entities
             rules = ["EXPENSE_DRAFT_PATCH"]
             if intent == "delete":
                 rules = ["EXPENSE_RULES_DELETE"]
-            elif intent in ("update", "modify_review"):
+            elif intent in ("update", "modify_review", "correct") or expense_turn_has_targeted_patches(
+                (u.entities or {}).get("expense_turn"), memory
+            ):
                 rules = ["EXPENSE_RULES_MODIFY"]
             return self._finish_expense_update_turn(
                 memory,
@@ -2563,11 +3127,69 @@ class WorkflowPipeline:
                 understanding=u,
             )
 
+        if (
+            not u.field_updates
+            and (
+                intent in ("update", "modify_review", "correct")
+                or expense_turn_has_targeted_patches((u.entities or {}).get("expense_turn"), memory)
+            )
+        ):
+            from chat.services.platform.field_extractors.expense import (
+                coerce_expense_correction_turn,
+                expense_turn_has_targeted_patches,
+                expense_turn_to_field_updates,
+            )
+
+            expense_turn = dict((u.entities or {}).get("expense_turn") or {})
+            if expense_turn_llm_blocked(expense_turn, memory):
+                body = self.composer.expense_llm_unavailable(lang=lang, for_edit=True)
+                if was_submit and draft:
+                    sync_expense_draft(draft)
+                    review_text, _ = self.review.prepare_review(memory, defn, lang=lang)
+                    if review_text:
+                        body = f"{body}\n\n{review_text}".strip()
+                return body, {
+                    "outcome": "NEEDS_INPUT",
+                    "rules_applied": ["EXPENSE_LLM_UNAVAILABLE"],
+                    "awaiting_confirmation": was_submit,
+                }
+            if expense_turn_has_targeted_patches(expense_turn, memory):
+                expense_turn = coerce_expense_correction_turn(expense_turn, memory)
+            if expense_turn.get("item_patches"):
+                _, patch_updates = expense_turn_to_field_updates(
+                    message,
+                    memory,
+                    trace_id=trace_id,
+                    conversation_history=conversation_history,
+                    expense_turn=expense_turn,
+                )
+                if patch_updates:
+                    return self._finish_expense_update_turn(
+                        memory,
+                        defn,
+                        updates=_review_safe_updates(list(patch_updates)),
+                        message=message,
+                        lang=lang,
+                        state=state,
+                        was_submit=was_submit,
+                        rules_applied=["EXPENSE_RULES_MODIFY"],
+                        conversation_history=conversation_history,
+                        trace_id=trace_id,
+                        understanding=u,
+                    )
+
         if intent == "conversation" or is_expense_ambiguous_ack(message):
             from chat.services.platform.intent_rules import is_delete_request, is_modify_request
 
             if (u.entities or {}).get("expense_llm_degraded") and not u.field_updates:
-                body = self.composer.expense_llm_unavailable(lang=lang)
+                body = self.composer.expense_llm_unavailable(
+                    lang=lang,
+                    for_edit=bool(
+                        is_modify_request(message)
+                        or is_delete_request(message)
+                        or expense_turn_llm_blocked(expense_turn, memory)
+                    ),
+                )
                 return body, {
                     "outcome": "NEEDS_INPUT",
                     "rules_applied": ["EXPENSE_LLM_DEGRADED"],
@@ -2583,7 +3205,7 @@ class WorkflowPipeline:
                     build_expense_pending_edit_from_turn,
                 )
 
-                pending_edit = build_expense_pending_edit_from_turn(turn, message=message)
+                pending_edit = build_expense_pending_edit_from_turn(turn, message=message, memory=memory)
                 if pending_edit:
                     state.push("merge_last_entities", value={"expense_pending_edit": pending_edit})
                 body = self.composer.expense_edit_clarify(memory, turn, lang=lang)
@@ -2970,6 +3592,9 @@ class WorkflowPipeline:
             return errors[0], {"outcome": "NEEDS_INPUT", "errors": errors}
 
         if was_submit or self.fields.missing_fields(draft, defn) == []:
+            blocked = self._leave_submitted_overlap_block(memory, lang, draft=draft)
+            if blocked:
+                return blocked
             state.push("clear_pending_question")
             state.push("set_pending_confirmation", value="submit")
             state.push("set_active_stage", value=WorkflowStage.CONFIRM_SUBMIT.value)
@@ -3094,11 +3719,30 @@ class WorkflowPipeline:
         understanding: UnderstandingResult | None = None,
     ) -> tuple[str, dict[str, Any]]:
         from chat.services.platform.field_engine import deserialize_field_updates
-        from chat.services.platform.field_extractors.expense import record_expense_last_ops
+        from chat.services.platform.field_extractors.expense import (
+            expense_pending_interrupted_by_updates,
+            expense_turn_llm_blocked,
+            clear_expense_blocked_add,
+            record_expense_last_ops,
+        )
 
         draft_before = memory.active_draft()
         item_count_before = len((draft_before.fields.get("items") or []) if draft_before else [])
         prev_ops = dict((memory.last_entities or {}).get("expense_last_ops") or {})
+        expense_turn = dict((understanding.entities or {}).get("expense_turn") or {}) if understanding else {}
+
+        if not updates and expense_turn.get("intent") == "repeat_ack":
+            prefix_parts = [self.composer.expense_already_recorded(lang=lang)]
+            if expense_turn.get("past_date_rejected"):
+                prefix_parts.insert(0, self.composer.expense_past_date_policy(lang=lang))
+            return self._continue_collection(
+                memory,
+                defn,
+                lang=lang,
+                prefix="\n\n".join(prefix_parts),
+                state=state,
+                extra_rules=rules_applied,
+            )
 
         applied_raw = state.apply_field_updates(
             updates,
@@ -3107,9 +3751,45 @@ class WorkflowPipeline:
         )
         applied = deserialize_field_updates(applied_raw)
         draft = memory.active_draft()
+        if defn.workflow_id == "expense" and expense_pending_interrupted_by_updates(applied, memory):
+            state.push("clear_pending_question")
+
+        items_before = list((draft_before.fields.get("items") or []) if draft_before else [])
         prefix = self.composer.item_prefix_from_updates(applied, lang=lang) if applied else ""
+        expense_intent = str(
+            expense_turn.get("intent")
+            or ((understanding.entities or {}).get("expense_intent") if understanding else None)
+            or ""
+        ).lower()
+        if expense_intent in ("replay_blocked_add", "date_correction") and applied:
+            clear_expense_blocked_add(memory)
+            notice = self.composer.expense_replay_blocked_ack(lang=lang)
+            prefix = "\n\n".join(p for p in [notice, prefix] if p).strip()
+        if expense_turn.get("past_date_rejected") and not expense_turn.get("date_policy_rejected"):
+            notice = self.composer.expense_past_date_policy(lang=lang)
+            prefix = "\n\n".join(p for p in [notice, prefix] if p).strip()
         wizard_fallback, llm_degraded = self._expense_wizard_flags(memory, understanding)
-        if wizard_fallback:
+        turn_wizard = bool(expense_turn.get("wizard_fallback"))
+        items_after = list((draft.fields.get("items") or []) if draft else [])
+        modify_no_op = (
+            defn.workflow_id == "expense"
+            and items_before == items_after
+            and "EXPENSE_RULES_MODIFY" in (rules_applied or [])
+            and expense_turn_llm_blocked(expense_turn, memory)
+        )
+        if modify_no_op:
+            body = self.composer.expense_llm_unavailable(lang=lang, for_edit=True)
+            if was_submit or memory.pending_confirmation == "submit":
+                state.push("set_active_stage", value=WorkflowStage.CONFIRM_SUBMIT.value)
+                review_text, _ = self.review.prepare_review(memory, defn, lang=lang)
+                if review_text:
+                    body = f"{body}\n\n{review_text}".strip()
+            return body, {
+                "outcome": "NEEDS_INPUT",
+                "rules_applied": ["EXPENSE_LLM_UNAVAILABLE"],
+                "awaiting_confirmation": bool(memory.pending_confirmation == "submit"),
+            }
+        if wizard_fallback and turn_wizard:
             notice = self.composer.expense_wizard_fallback_notice(
                 lang=lang,
                 llm_degraded=llm_degraded,
@@ -3126,6 +3806,32 @@ class WorkflowPipeline:
                 notes.append(f"added item {new_count}")
             if new_count < item_count_before:
                 notes.append("deleted item")
+            delete_requested = bool(
+                rules_applied
+                and "EXPENSE_RULES_DELETE" in (rules_applied or [])
+            )
+            if delete_requested and new_count >= item_count_before and item_count_before > 0:
+                defn = self.manager.ensure_definition("expense")
+                clarify_turn = {
+                    "intent": "clarify_delete",
+                    "item_patches": [],
+                    "clarify": {
+                        "kind": "which_delete",
+                        "candidate_indices": list(range(item_count_before)),
+                    },
+                }
+                from chat.services.platform.field_extractors.expense import (
+                    build_expense_pending_edit_from_turn,
+                )
+
+                pending_edit = build_expense_pending_edit_from_turn(clarify_turn, message=message, memory=memory)
+                if pending_edit:
+                    state.push("merge_last_entities", value={"expense_pending_edit": pending_edit})
+                body = self.composer.expense_edit_clarify(memory, clarify_turn, lang=lang)
+                return body, {
+                    "outcome": "NEEDS_CLARIFICATION",
+                    "rules_applied": ["EXPENSE_DELETE_CLARIFY"],
+                }
             intent_hint = str((memory.last_entities or {}).get("expense_pending_intent") or "")
             record_expense_last_ops(
                 memory,
@@ -3226,14 +3932,127 @@ class WorkflowPipeline:
 
         if draft.workflow_id == "expense":
             from chat.services.platform.field_extractors.modify import parse_delete_request
-            from chat.services.platform.field_extractors.expense import sync_expense_draft
+            from chat.services.platform.field_extractors.expense import (
+                expense_delete_field_updates,
+                normalize_expense_delete_turn,
+                sync_expense_draft,
+            )
 
             sync_expense_draft(draft)
             items = list(draft.fields.get("items") or [])
             was_submit = memory.pending_confirmation == "submit"
+            from chat.services.platform.field_extractors.expense import (
+                is_expense_draft_mutation_message,
+                sanitize_expense_turn_for_action,
+            )
+
+            expense_turn = dict((u.entities or {}).get("expense_turn") or {}) if u else {}
+            if is_expense_draft_mutation_message(message, memory) and str(
+                expense_turn.get("intent") or ""
+            ).lower() in ("add", "answer_pending", "conversation", ""):
+                expense_turn = {}
+            expense_turn = sanitize_expense_turn_for_action(
+                expense_turn,
+                action=str(u.action or "") if u else "",
+                expense_intent=str((u.entities or {}).get("expense_intent") or "") if u else "",
+            )
+            expense_intent = str(
+                (u.entities or {}).get("expense_intent") or expense_turn.get("intent") or ""
+            ).lower()
+
+            if u and u.action == UnderstandingAction.MODIFY.value and (
+                "delete" in (u.goal or "").lower() or "delete" in (u.reasoning or "").lower()
+            ):
+                u = UnderstandingResult(
+                    goal=u.goal,
+                    workflow=u.workflow,
+                    action=UnderstandingAction.DELETE.value,
+                    confidence=u.confidence,
+                    field_updates=u.field_updates,
+                    targets=u.targets,
+                    entities=u.entities,
+                    reasoning=u.reasoning,
+                    source=u.source,
+                    answers_pending_field=u.answers_pending_field,
+                )
+
+            if expense_intent == "clarify_delete" or is_vague_delete(message):
+                clarify_turn = expense_turn if expense_intent == "clarify_delete" else {
+                    "intent": "clarify_delete",
+                    "item_patches": [],
+                    "clarify": {
+                        "kind": "which_delete",
+                        "candidate_indices": list(range(len(items))),
+                    },
+                }
+                from chat.services.platform.field_extractors.expense import (
+                    build_expense_pending_edit_from_turn,
+                )
+
+                pending_edit = build_expense_pending_edit_from_turn(clarify_turn, message=message, memory=memory)
+                if pending_edit:
+                    state.push("merge_last_entities", value={"expense_pending_edit": pending_edit})
+                defn = self.manager.ensure_definition("expense")
+                body = self.composer.expense_edit_clarify(memory, clarify_turn, lang=lang)
+                return body, {
+                    "outcome": "NEEDS_CLARIFICATION",
+                    "rules_applied": ["EXPENSE_DELETE_CLARIFY"],
+                }
+
+            expense_turn = normalize_expense_delete_turn(expense_turn, message, memory)
+            if str(expense_turn.get("intent") or "").lower() == "delete" and (
+                expense_turn.get("item_patches") or expense_turn.get("delete_indices")
+            ):
+                fields = dict(draft.fields or {})
+                retry_updates = expense_delete_field_updates(fields, expense_turn)
+                if retry_updates:
+                    defn = self.manager.ensure_definition("expense")
+                    return self._finish_expense_update_turn(
+                        memory,
+                        defn,
+                        updates=retry_updates,
+                        message=message,
+                        lang=lang,
+                        state=state,
+                        was_submit=was_submit,
+                        rules_applied=["EXPENSE_RULES_DELETE"],
+                        trace_id=trace_id,
+                        understanding=understanding,
+                    )
+
+            if u and u.action == UnderstandingAction.DELETE.value and u.targets:
+                delete_updates = [
+                    FieldUpdate(
+                        field="items",
+                        value={},
+                        item_index=int(t.item_index),
+                        action="delete",
+                    )
+                    for t in u.targets
+                    if t.item_index is not None
+                    and 0 <= int(t.item_index) < len(items)
+                ]
+                if delete_updates:
+                    from chat.services.platform.field_extractors.expense import clear_expense_blocked_add
+
+                    clear_expense_blocked_add(memory)
+                    defn = self.manager.ensure_definition("expense")
+                    return self._finish_expense_update_turn(
+                        memory,
+                        defn,
+                        updates=delete_updates,
+                        message=message,
+                        lang=lang,
+                        state=state,
+                        was_submit=was_submit,
+                        rules_applied=["EXPENSE_RULES_DELETE"],
+                        trace_id=trace_id,
+                        understanding=understanding,
+                    )
+
             if not is_vague_delete(message):
                 parsed = parse_delete_request(message, items)
-                if parsed:
+                if parsed and parsed.get("item_index") is not None:
                     defn = self.manager.ensure_definition("expense")
                     return self._finish_expense_update_turn(
                         memory,
@@ -3254,14 +4073,42 @@ class WorkflowPipeline:
                         trace_id=trace_id,
                         understanding=understanding,
                     )
-            turn = dict((u.entities or {}).get("expense_turn") or {}) if u else {}
-            if turn.get("item_patches") or turn.get("delete_indices"):
+                if parsed and parsed.get("needs_clarify"):
+                    turn = {
+                        "intent": "clarify_delete",
+                        "item_patches": [],
+                        "clarify": {
+                            "kind": "which_delete",
+                            "candidate_indices": list(parsed.get("candidate_indices") or []),
+                            "category": parsed.get("category") or parsed.get("label"),
+                        },
+                    }
+                    from chat.services.platform.field_extractors.expense import (
+                        build_expense_pending_edit_from_turn,
+                    )
+
+                    pending_edit = build_expense_pending_edit_from_turn(turn, message=message, memory=memory)
+                    if pending_edit:
+                        state.push("merge_last_entities", value={"expense_pending_edit": pending_edit})
+                    body = self.composer.expense_edit_clarify(memory, turn, lang=lang)
+                    return body, {
+                        "outcome": "NEEDS_CLARIFICATION",
+                        "rules_applied": ["EXPENSE_DELETE_CLARIFY"],
+                    }
+            turn = normalize_expense_delete_turn(
+                dict((u.entities or {}).get("expense_turn") or {}) if u else {},
+                message,
+                memory,
+            )
+            if str(turn.get("intent") or "").lower() == "delete" and (
+                turn.get("item_patches") or turn.get("delete_indices")
+            ):
                 from chat.services.platform.field_extractors.expense import (
-                    patches_to_field_updates,
+                    expense_delete_field_updates,
                 )
 
                 fields = dict(draft.fields or {})
-                retry_updates = patches_to_field_updates(fields, turn)
+                retry_updates = expense_delete_field_updates(fields, turn)
                 if retry_updates:
                     defn = self.manager.ensure_definition("expense")
                     return self._finish_expense_update_turn(
@@ -3278,6 +4125,13 @@ class WorkflowPipeline:
                     )
             defn = self.manager.ensure_definition("expense")
             turn = {"intent": "clarify_delete", "item_patches": []}
+            from chat.services.platform.field_extractors.expense import (
+                build_expense_pending_edit_from_turn,
+            )
+
+            pending_edit = build_expense_pending_edit_from_turn(turn, message=message, memory=memory)
+            if pending_edit:
+                state.push("merge_last_entities", value={"expense_pending_edit": pending_edit})
             body = self.composer.expense_edit_clarify(memory, turn, lang=lang)
             return body, {
                 "outcome": "NEEDS_CLARIFICATION",
@@ -3318,11 +4172,15 @@ class WorkflowPipeline:
 
         if not (message or "").strip():
             return False
+        fresh = self._is_new_expense_claim(message)
+        if fresh:
+            self._prepare_fresh_expense_draft(state, memory)
         _, updates = expense_turn_to_field_updates(
             message,
             memory,
             trace_id=trace_id,
             conversation_history=conversation_history or [],
+            fresh_claim=fresh,
         )
         if not updates:
             return False
@@ -3348,9 +4206,16 @@ class WorkflowPipeline:
             return self.composer.which_workflow(lang=lang), {"outcome": "NEEDS_CLARIFICATION"}
         suspended_before = {sw.workflow_id for sw in memory.suspended_workflows}
         prev_active = memory.active_workflow.id if memory.active_workflow else None
-        is_resume = target in suspended_before
+        new_claim = target == "expense" and self._is_new_expense_claim(message, u)
+        if new_claim:
+            self._prepare_fresh_expense_draft(state, memory)
+        is_resume = target in suspended_before and not new_claim
         state.push("switch_to_workflow", value=target)
         state.flush()
+        if new_claim:
+            state.push("set_active_stage", value=WorkflowStage.COLLECTING.value)
+            state.push("clear_pending_confirmation")
+            state.flush()
         defn = self.manager.ensure_definition(target)
         draft = state.ensure_active_draft(target)
         if not draft:
@@ -3414,7 +4279,7 @@ class WorkflowPipeline:
                     and not (u.entities or {}).get("expense_wizard_fallback")
                 )
             ):
-                body = self.composer.expense_llm_unavailable(lang=lang)
+                body = self.composer.expense_llm_unavailable(lang=lang, for_edit=True)
                 if prefix:
                     body = f"{prefix}\n\n{body}".strip()
                 return body, {
@@ -3452,7 +4317,7 @@ class WorkflowPipeline:
         if defn.workflow_id == "leave":
             from chat.services.platform.field_extractors.leave import apply_leave_derived_fields
 
-            apply_leave_derived_fields(draft)
+            apply_leave_derived_fields(draft, message="")
             state.push("merge_last_entities", value={"leave_start_clarify": False})
 
         requested = (memory.last_entities or {}).get("requested_leave_type")
@@ -3502,6 +4367,10 @@ class WorkflowPipeline:
             collect_rules.append("FIELD_COLLECTION")
 
         if not missing and not errors:
+            if defn.workflow_id == "leave":
+                blocked = self._leave_submitted_overlap_block(memory, lang, draft=draft)
+                if blocked:
+                    return blocked
             review_text, _ = self.review.prepare_review(memory, defn, lang=lang)
             state.push("clear_pending_question")
             state.push("set_pending_confirmation", value="submit")
@@ -3558,6 +4427,11 @@ class WorkflowPipeline:
         if errors:
             return errors[0], {"outcome": "NEEDS_INPUT", "errors": errors}
 
+        if defn.workflow_id == "leave":
+            blocked = self._leave_submitted_overlap_block(memory, lang, draft=draft)
+            if blocked:
+                return blocked
+
         review_text, _ = self.review.prepare_review(memory, defn, lang=lang)
         state.push("set_pending_confirmation", value="submit")
         return self.composer.submit_confirm(review_text or "", lang=lang), {
@@ -3581,6 +4455,12 @@ class WorkflowPipeline:
         if missing:
             state.push("clear_pending_confirmation")
             return self.composer.missing_for_submit(missing, lang=lang), {"outcome": "NEEDS_INPUT"}
+
+        if defn.workflow_id == "leave":
+            blocked = self._leave_submitted_overlap_block(memory, lang)
+            if blocked:
+                state.push("clear_pending_confirmation")
+                return blocked
 
         msg, meta = self.submission.confirm_and_submit(
             memory,
@@ -3643,6 +4523,20 @@ class WorkflowPipeline:
             state.push("clear_pending_confirmation")
             state.push("set_active_stage", value=WorkflowStage.COLLECTING.value)
             return None
+        from chat.services.platform.workflow_show import resolve_workflow_show_target
+
+        show_target = str((u.entities or {}).get("show_workflow_target") or "").lower()
+        if not show_target:
+            show_target = resolve_workflow_show_target(
+                message,
+                memory,
+                active_workflow_id=defn.workflow_id,
+            ) or ""
+        if show_target == "leave":
+            return self.composer.leave_status_report(memory, lang=lang), {
+                "outcome": "INFORMATIONAL",
+                "rules_applied": ["LEAVE_SESSION_SUMMARY"],
+            }
         review_text, _ = self.review.prepare_review(memory, defn, lang=lang)
         return self.composer.submit_confirm(review_text or "", lang=lang), {
             "outcome": "NEEDS_INPUT",
@@ -3677,6 +4571,24 @@ class WorkflowPipeline:
         if not start:
             return None
         hit = find_submitted_leave_overlap(memory, str(start), str(end) if end else None)
+        if not hit:
+            return None
+        msg = self.composer.submitted_leave_overlap(hit, lang=lang)
+        return msg, {
+            "outcome": "NEEDS_CLARIFICATION",
+            "rules_applied": ["SUBMITTED_LEAVE_DATE_OVERLAP"],
+        }
+
+    def _leave_submitted_overlap_block(
+        self,
+        memory: SessionMemory,
+        lang: str,
+        *,
+        draft=None,
+    ) -> tuple[str, dict[str, Any]] | None:
+        from chat.services.platform.field_extractors.leave import draft_overlaps_submitted_leave
+
+        hit = draft_overlaps_submitted_leave(memory, draft)
         if not hit:
             return None
         msg = self.composer.submitted_leave_overlap(hit, lang=lang)
@@ -3745,7 +4657,9 @@ class WorkflowPipeline:
     ) -> tuple[str, dict[str, Any]]:
         draft = memory.active_draft()
         if defn.workflow_id == "expense" and draft:
-            return self.composer.workflow_summary(defn, draft, lang=lang), {"outcome": "INFORMATIONAL"}
+            return self.composer.workflow_summary(defn, draft, lang=lang, memory=memory), {
+                "outcome": "INFORMATIONAL"
+            }
         if defn.workflow_id == "leave":
             draft = memory.active_draft()
             if draft and draft.locked:
@@ -4129,11 +5043,12 @@ class WorkflowPipeline:
 
     @staticmethod
     def _push_default_expense_date(state: StatePatchBuffer, memory: SessionMemory) -> None:
-        draft = memory.active_draft()
-        if draft and draft.workflow_id == "expense" and not draft.fields.get("incurred_date"):
-            from datetime import date
+        from datetime import date
 
-            state.set_draft_field("incurred_date", date.today().isoformat())
+        draft = memory.active_draft()
+        if draft and draft.workflow_id == "expense":
+            if not draft.fields.get("incurred_date"):
+                state.set_draft_field("incurred_date", date.today().isoformat())
 
     @staticmethod
     def _active_defn(memory: SessionMemory):

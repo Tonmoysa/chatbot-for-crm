@@ -6,6 +6,7 @@ Phase 3: maps UnderstandingResult → PendingQuestionDecision; no legacy re-inte
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -95,6 +96,267 @@ _PLATFORM_PQ_KINDS = frozenset(
 )
 
 
+def intent_priority_decision(
+    message: str,
+    *,
+    memory: SessionMemory,
+    understanding: UnderstandingResult,
+) -> "PendingQuestionDecision | None":
+    """Structured understanding beats open pending_question (SSOT priority)."""
+    from chat.services.platform.field_extractors.expense import (
+        expense_turn_has_targeted_patches,
+        message_has_new_expense_items,
+        message_requests_submit_after_edit,
+        pending_expense_edit_active,
+        resolve_pending_expense_edit_turn,
+    )
+    from chat.services.platform.intent_rules import parse_submit_workflow
+
+    aw = memory.active_workflow
+    pq = memory.pending_question
+    conf = understanding.confidence
+    src = understanding.source or "understanding"
+    expense_intent = str((understanding.entities or {}).get("expense_intent") or "").lower()
+    expense_turn = (understanding.entities or {}).get("expense_turn")
+    wf = understanding.workflow or (aw.id if aw else "")
+
+    from chat.services.platform.turn_semantics import is_expense_review_request
+
+    cancel_target = str((understanding.entities or {}).get("cancel_workflow_target") or "").lower()
+    if not cancel_target:
+        from chat.services.platform.workflow_cancel import resolve_workflow_cancel_target
+
+        cancel_target = (
+            resolve_workflow_cancel_target(
+                message,
+                memory,
+                active_workflow_id=aw.id if aw else "",
+            )
+            or ""
+        )
+    if cancel_target in ("leave", "expense") or understanding.action == UnderstandingAction.CANCEL.value:
+        wf = cancel_target or understanding.workflow or (aw.id if aw else None)
+        return PendingQuestionDecision(
+            kind=MessageIntentKind.CANCEL_WORKFLOW,
+            confidence=max(conf, 0.92),
+            reasoning=understanding.reasoning or f"Cancel {wf} workflow.",
+            source=src,
+            blocks_new_workflow=True,
+            target_workflow=wf if wf not in ("none", "") else None,
+            extracted_entities={"interrupts_pending": bool(pq)},
+        )
+
+    show_target = str((understanding.entities or {}).get("show_workflow_target") or "").lower()
+    if not show_target:
+        from chat.services.platform.workflow_show import resolve_workflow_show_target
+
+        show_target = (
+            resolve_workflow_show_target(
+                message,
+                memory,
+                active_workflow_id=aw.id if aw else "",
+            )
+            or ""
+        )
+    if show_target in ("leave", "expense"):
+        return PendingQuestionDecision(
+            kind=MessageIntentKind.SHOW_REVIEW,
+            confidence=max(conf, 0.92),
+            reasoning=understanding.reasoning or f"Show {show_target} summary.",
+            source=src,
+            blocks_new_workflow=True,
+            target_workflow=show_target,
+            extracted_entities={"interrupts_pending": bool(pq)},
+        )
+
+    if is_expense_review_request(message, understanding):
+        return PendingQuestionDecision(
+            kind=MessageIntentKind.SHOW_REVIEW,
+            confidence=max(conf, 0.9),
+            reasoning=understanding.reasoning or "Show expense list or summary.",
+            source=src,
+            blocks_new_workflow=True,
+            target_workflow="expense",
+            extracted_entities={"interrupts_pending": bool(pq)},
+        )
+
+    from chat.services.platform.intent_rules import is_bare_confirmation
+
+    if (
+        pq
+        and pq.workflow_id == "expense"
+        and is_bare_confirmation(message)
+        and pq.field in ("item_route", "item_category", "item_amount", "route")
+    ):
+        return _decision(
+            MessageIntentKind.ANSWER_PENDING,
+            reasoning=f"Pending {pq.field} — need a field value, not yes/no.",
+        )
+
+    if (
+        understanding.interrupt_workflow
+        and aw
+        and understanding.interrupt_workflow != aw.id
+        and conf >= 0.65
+        and not is_expense_review_request(message, understanding)
+    ):
+        return PendingQuestionDecision(
+            kind=MessageIntentKind.SWITCH_WORKFLOW,
+            confidence=max(conf, 0.85),
+            reasoning=understanding.reasoning or f"Switch to {understanding.interrupt_workflow}.",
+            source=src,
+            blocks_new_workflow=True,
+            target_workflow=understanding.interrupt_workflow,
+            extracted_entities={"interrupts_pending": bool(pq)},
+        )
+
+    def _decision(kind: MessageIntentKind, *, reasoning: str, target: str | None = None):
+        return PendingQuestionDecision(
+            kind=kind,
+            confidence=max(conf, 0.88),
+            reasoning=reasoning,
+            source=src,
+            blocks_new_workflow=True,
+            target_workflow=target or (aw.id if aw else wf or None),
+            extracted_entities={"interrupts_pending": bool(pq)},
+        )
+
+    if understanding.action == UnderstandingAction.DELETE.value or expense_intent in (
+        "delete",
+        "clarify_delete",
+    ):
+        if expense_intent == "clarify_delete" and not understanding.field_updates:
+            if not expense_turn_has_targeted_patches(expense_turn, memory):
+                return _decision(
+                    MessageIntentKind.CLARIFICATION_NEEDED,
+                    reasoning=understanding.reasoning or "Clarify which expense to delete.",
+                )
+        return _decision(
+            MessageIntentKind.DELETE_DATA,
+            reasoning=understanding.reasoning or "Delete expense line.",
+        )
+
+    has_patches = bool(
+        understanding.field_updates
+        or expense_turn_has_targeted_patches(expense_turn, memory)
+    )
+    if understanding.action == UnderstandingAction.MODIFY.value or expense_intent in (
+        "modify_review",
+        "update",
+        "correct",
+    ):
+        if has_patches and not (
+            pq
+            and pq.workflow_id == "expense"
+            and is_bare_confirmation(message)
+        ):
+            return _decision(
+                MessageIntentKind.MODIFY_DATA,
+                reasoning=understanding.reasoning or "Modify expense line.",
+            )
+
+    item_field_updates = [
+        u
+        for u in (understanding.field_updates or [])
+        if getattr(u, "field", None) == "items"
+    ]
+
+    if expense_intent == "add" and understanding.field_updates:
+        if message_has_new_expense_items(message) and item_field_updates:
+            return _decision(
+                MessageIntentKind.MODIFY_DATA,
+                reasoning=understanding.reasoning or "Compound expense overrides pending slot.",
+            )
+        if not pq and (not aw or aw.id != "expense"):
+            return PendingQuestionDecision(
+                kind=MessageIntentKind.NEW_WORKFLOW,
+                confidence=max(conf, 0.88),
+                reasoning=understanding.reasoning or "New expense claim with line items.",
+                source=src,
+                blocks_new_workflow=False,
+                target_workflow="expense",
+                extracted_entities={"interrupts_pending": bool(pq)},
+            )
+        if not item_field_updates:
+            return _decision(
+                MessageIntentKind.ANSWER_PENDING,
+                reasoning=understanding.reasoning or "Add expense line.",
+                target=aw.id if aw else "expense",
+            )
+        return _decision(
+            MessageIntentKind.MODIFY_DATA,
+            reasoning=understanding.reasoning or "Add expense line.",
+            target=aw.id if aw else "expense",
+        )
+
+    if understanding.action == UnderstandingAction.REVIEW.value or expense_intent in (
+        "show_summary",
+        "show_list",
+        "show_total",
+    ):
+        return _decision(
+            MessageIntentKind.SHOW_REVIEW,
+            reasoning=understanding.reasoning or "Show expense draft.",
+        )
+
+    active_wf = aw.id if aw else "expense"
+    wants_submit = (
+        understanding.action == UnderstandingAction.SUBMIT.value
+        or expense_intent in ("confirm", "submit")
+        or message_requests_submit_after_edit(message, active_workflow_id=active_wf)
+        or (
+            message_has_new_expense_items(message)
+            and parse_submit_workflow(message, active_workflow_id=active_wf)
+        )
+    )
+    if wants_submit:
+        if message_has_new_expense_items(message) and has_patches:
+            return _decision(
+                MessageIntentKind.MODIFY_DATA,
+                reasoning=understanding.reasoning or "Apply expense items before submit.",
+            )
+        return _decision(
+            MessageIntentKind.ANSWER_PENDING,
+            reasoning=understanding.reasoning or "Confirm submit.",
+        )
+
+    if pending_expense_edit_active(memory):
+        resolved = resolve_pending_expense_edit_turn(message, memory)
+        if resolved and (
+            resolved.get("item_patches") or resolved.get("delete_indices")
+        ):
+            resolved_intent = str(resolved.get("intent") or "").lower()
+            if resolved_intent == "delete":
+                return _decision(
+                    MessageIntentKind.DELETE_DATA,
+                    reasoning="Resolve pending edit clarification (delete).",
+                )
+            return _decision(
+                MessageIntentKind.MODIFY_DATA,
+                reasoning="Resolve pending edit clarification (modify).",
+            )
+
+    if expense_intent in ("clarify_modify", "clarify_delete"):
+        return _decision(
+            MessageIntentKind.CLARIFICATION_NEEDED,
+            reasoning=understanding.reasoning or "Expense edit clarification.",
+        )
+
+    if pq and understanding.answers_pending_field is True and understanding.field_updates:
+        return PendingQuestionDecision(
+            kind=MessageIntentKind.ANSWER_PENDING,
+            confidence=max(conf, 0.85),
+            reasoning=understanding.reasoning or f"Answer pending field '{pq.field}'.",
+            source=src,
+            blocks_new_workflow=True,
+            field_value=message.strip(),
+            target_workflow=pq.workflow_id or (aw.id if aw else None),
+            extracted_entities={"interrupts_pending": False},
+        )
+
+    return None
+
+
 def _expense_pending_slot_answer(
     message: str,
     memory: SessionMemory,
@@ -102,6 +364,11 @@ def _expense_pending_slot_answer(
 ) -> bool:
     """True when user is answering an expense pending slot — must not switch to leave."""
     from chat.services.platform.intent_rules import is_resume_workflow_request, is_switch_request
+    from chat.services.platform.field_extractors.expense import (
+        is_expense_draft_mutation_message,
+        is_expense_pending_field_value_answer,
+        resolve_pending_expense_edit_turn,
+    )
 
     pq = memory.pending_question
     aw = memory.active_workflow
@@ -109,25 +376,56 @@ def _expense_pending_slot_answer(
         return False
     if not aw or aw.id != "expense":
         return False
+    if is_expense_draft_mutation_message(message, memory):
+        return False
     low = (message or "").lower()
     if is_resume_workflow_request(message, workflow_id="leave") or (
         is_switch_request(message, active_workflow_id="expense") and "leave" in low
     ):
         return False
+    if resolve_pending_expense_edit_turn(message, memory):
+        return False
+    pending_edit = (memory.last_entities or {}).get("expense_pending_edit")
+    if pending_edit:
+        return False
+    last_intent = str((memory.last_entities or {}).get("expense_intent") or "")
+    if last_intent == "clarify_delete" and re.search(r"\d", message or ""):
+        return False
     if understanding.answers_pending_field is False:
         return False
+    expense_intent = str((understanding.entities or {}).get("expense_intent") or "").lower()
+    if expense_intent in (
+        "update",
+        "modify_review",
+        "correct",
+        "fix_mistake",
+        "delete",
+        "clarify_delete",
+        "show_summary",
+        "show_list",
+        "show_total",
+    ):
+        return False
+    if understanding.action in (
+        UnderstandingAction.MODIFY.value,
+        UnderstandingAction.DELETE.value,
+        UnderstandingAction.REVIEW.value,
+    ):
+        return False
+    if is_expense_pending_field_value_answer(message, memory):
+        return True
     if understanding.answers_pending_field is True:
         return True
     if any(u.field == "items" for u in (understanding.field_updates or [])):
-        return True
+        return is_expense_pending_field_value_answer(message, memory)
     intent = str((understanding.entities or {}).get("expense_intent") or "")
     if intent in ("answer_pending", "add", "update", "correct"):
-        return True
+        return is_expense_pending_field_value_answer(message, memory)
     if understanding.action in (
         UnderstandingAction.COLLECT.value,
         UnderstandingAction.CONFIRM.value,
     ):
-        return True
+        return is_expense_pending_field_value_answer(message, memory)
     return False
 
 _PLAN_OP_EXECUTION_ROUTES: dict[str, str] = {
@@ -149,6 +447,7 @@ def informational_priority_decision(
     memory: SessionMemory,
     conversation_history: list[str] | None = None,
     include_policy_status: bool = True,
+    understanding: UnderstandingResult | None = None,
 ) -> PendingQuestionDecision | None:
     """Message-level informational signals that win over workflow slot interpretation."""
     raw = (message or "").strip()
@@ -157,6 +456,25 @@ def informational_priority_decision(
 
     pq = memory.pending_question
     blocks = bool(pq)
+
+    from chat.services.platform.intent_rules import is_greeting_or_chitchat
+
+    if understanding is not None and understanding.is_greeting:
+        return PendingQuestionDecision(
+            kind=MessageIntentKind.NEW_WORKFLOW,
+            confidence=0.95,
+            reasoning=understanding.reasoning or "Greeting — conversational reply.",
+            source=understanding.source or "rules",
+            blocks_new_workflow=False,
+        )
+    if is_greeting_or_chitchat(raw):
+        return PendingQuestionDecision(
+            kind=MessageIntentKind.NEW_WORKFLOW,
+            confidence=0.95,
+            reasoning="Greeting — conversational reply.",
+            source="rules",
+            blocks_new_workflow=False,
+        )
 
     if is_hr_today_date_query(raw):
         return PendingQuestionDecision(
@@ -167,16 +485,74 @@ def informational_priority_decision(
             blocks_new_workflow=False,
         )
 
-        from chat.services.platform.intent_rules import is_clearly_off_hr_question, is_off_hr_topic_message
+    from chat.services.platform.workflow_cancel import resolve_workflow_cancel_target
+    from chat.services.platform.workflow_show import session_has_workflow_context
 
-        if is_clearly_off_hr_question(raw) or is_off_hr_topic_message(raw, memory=memory):
+    if session_has_workflow_context(memory):
+        cancel_wf = resolve_workflow_cancel_target(
+            raw,
+            memory,
+            conversation_history=conversation_history,
+        )
+        if cancel_wf in ("leave", "expense"):
             return PendingQuestionDecision(
-                kind=MessageIntentKind.OUT_OF_SCOPE,
-                confidence=0.93,
-                reasoning="General / programming question outside HR assistant scope.",
-                source="rules",
-                blocks_new_workflow=False,
+                kind=MessageIntentKind.CANCEL_WORKFLOW,
+                confidence=0.92,
+                reasoning=f"Cancel {cancel_wf} draft (session-aware LLM routing).",
+                source="llm_workflow_cancel",
+                blocks_new_workflow=True,
+                target_workflow=cancel_wf,
             )
+
+    from chat.services.platform.workflow_show import (
+        _message_might_be_show_request,
+        resolve_workflow_show_target,
+    )
+
+    if session_has_workflow_context(memory) and _message_might_be_show_request(raw):
+        aw = memory.active_workflow
+        show_wf = resolve_workflow_show_target(
+            raw,
+            memory,
+            active_workflow_id=aw.id if aw else "",
+            conversation_history=conversation_history,
+        )
+        if show_wf in ("leave", "expense"):
+            return PendingQuestionDecision(
+                kind=MessageIntentKind.SHOW_REVIEW,
+                confidence=0.92,
+                reasoning=f"Show {show_wf} summary (session-aware LLM routing).",
+                source="llm_workflow_show",
+                blocks_new_workflow=True,
+                target_workflow=show_wf,
+            )
+
+    from chat.services.platform.intent_rules import is_clearly_off_hr_question, is_off_hr_topic_message
+
+    if is_clearly_off_hr_question(raw) or is_off_hr_topic_message(raw, memory=memory):
+        return PendingQuestionDecision(
+            kind=MessageIntentKind.OUT_OF_SCOPE,
+            confidence=0.93,
+            reasoning="General / programming question outside HR assistant scope.",
+            source="rules",
+            blocks_new_workflow=False,
+        )
+
+    from chat.services.platform.hr_assistant_scope import resolve_hr_assistant_scope
+
+    scope_oos = resolve_hr_assistant_scope(
+        raw,
+        memory,
+        conversation_history=conversation_history,
+    )
+    if scope_oos is not None and scope_oos.is_out_of_scope:
+        return PendingQuestionDecision(
+            kind=MessageIntentKind.OUT_OF_SCOPE,
+            confidence=scope_oos.confidence,
+            reasoning=scope_oos.reasoning or "Off-topic for HR assistant.",
+            source=scope_oos.source or "llm_hr_scope",
+            blocks_new_workflow=False,
+        )
 
     translate_to = is_translation_request(raw)
     if translate_to and _assistant_text_for_translation(
@@ -203,8 +579,44 @@ def informational_priority_decision(
     from chat.services.platform.field_extractors.expense import is_expense_review_edit_turn
 
     expense_review_edit = bool(
-        aw and aw.id == "expense" and is_expense_review_edit_turn(raw, memory)
+        aw and aw.id == "expense" and is_expense_review_edit_turn(raw, memory, understanding)
     )
+
+    if understanding is not None:
+        goal_low = (understanding.goal or "").lower()
+        reasoning_low = (understanding.reasoning or "").lower()
+        if understanding.action == UnderstandingAction.DELETE.value or (
+            understanding.action == UnderstandingAction.MODIFY.value
+            and ("delete" in goal_low or "delete" in reasoning_low)
+        ):
+            return PendingQuestionDecision(
+                kind=MessageIntentKind.DELETE_DATA,
+                confidence=max(understanding.confidence, 0.88),
+                reasoning=understanding.reasoning or "Delete expense line.",
+                source=understanding.source or "understanding",
+                blocks_new_workflow=True,
+                target_workflow=aw.id if aw else "expense",
+            )
+        if understanding.action == UnderstandingAction.MODIFY.value:
+            from chat.services.platform.field_extractors.expense import (
+                expense_turn_has_targeted_patches,
+            )
+
+            expense_turn = (understanding.entities or {}).get("expense_turn")
+            if (
+                expense_review_edit
+                or understanding.field_updates
+                or expense_turn_has_targeted_patches(expense_turn, memory)
+            ):
+                return PendingQuestionDecision(
+                    kind=MessageIntentKind.MODIFY_DATA,
+                    confidence=max(understanding.confidence, 0.88),
+                    reasoning=understanding.reasoning or "Modify expense line.",
+                    source=understanding.source or "understanding",
+                    blocks_new_workflow=True,
+                    target_workflow=aw.id if aw else "expense",
+                    extracted_entities={"interrupts_pending": bool(pq)},
+                )
 
     if should_resume_suspended_expense(
         message=raw,
@@ -238,7 +650,7 @@ def informational_priority_decision(
             target_workflow="leave",
         )
 
-    if aw and is_workflow_show_request(raw, workflow_id=aw.id):
+    if aw and not expense_review_edit and is_workflow_show_request(raw, workflow_id=aw.id):
         return PendingQuestionDecision(
             kind=MessageIntentKind.SHOW_REVIEW,
             confidence=0.92,
@@ -353,11 +765,53 @@ class PendingQuestionEngine:
             self._log(trace_id, raw, memory, decision, understanding=understanding)
             return decision
 
+        if understanding is not None:
+            priority = intent_priority_decision(
+                raw,
+                memory=memory,
+                understanding=understanding,
+            )
+            if priority is not None:
+                decision = self._apply_confidence_guard(
+                    self._apply_pending_guardrails(
+                        raw, memory, priority, understanding=understanding
+                    )
+                )
+                self._log(trace_id, raw, memory, decision, understanding=understanding)
+                return decision
+
+            from chat.services.platform.turn_semantics import is_expense_review_request
+
+            if (
+                understanding.interrupt_workflow
+                and memory.active_workflow
+                and understanding.interrupt_workflow != memory.active_workflow.id
+                and understanding.confidence >= 0.65
+                and not is_expense_review_request(raw, understanding)
+            ):
+                decision = PendingQuestionDecision(
+                    kind=MessageIntentKind.SWITCH_WORKFLOW,
+                    confidence=max(understanding.confidence, 0.85),
+                    reasoning=understanding.reasoning
+                    or f"Switch to {understanding.interrupt_workflow}.",
+                    source=understanding.source or "understanding",
+                    blocks_new_workflow=True,
+                    target_workflow=understanding.interrupt_workflow,
+                )
+                decision = self._apply_confidence_guard(
+                    self._apply_pending_guardrails(
+                        raw, memory, decision, understanding=understanding
+                    )
+                )
+                self._log(trace_id, raw, memory, decision, understanding=understanding)
+                return decision
+
         info_decision = informational_priority_decision(
             raw,
             memory=memory,
             conversation_history=conversation_history,
             include_policy_status=True,
+            understanding=understanding,
         )
         if info_decision is not None:
             decision = self._apply_confidence_guard(
@@ -605,7 +1059,18 @@ class PendingQuestionEngine:
         memory: SessionMemory,
         conversation_history: list[str],
     ) -> PendingQuestionDecision | None:
-        """Turns that skip Understanding — today date and translation follow-ups."""
+        """Turns that skip Understanding — greeting, today date, translation follow-ups."""
+        from chat.services.platform.intent_rules import is_greeting_or_chitchat
+
+        raw = (message or "").strip()
+        if is_greeting_or_chitchat(raw):
+            return PendingQuestionDecision(
+                kind=MessageIntentKind.NEW_WORKFLOW,
+                confidence=0.95,
+                reasoning="Greeting — conversational reply.",
+                source="rules",
+                blocks_new_workflow=False,
+            )
         return informational_priority_decision(
             message,
             memory=memory,
@@ -620,13 +1085,56 @@ class PendingQuestionEngine:
             entities["translation_target_lang"] = pq.field_value
         if pq.kind == MessageIntentKind.ASK_TODAY_DATE:
             entities["calendar_date_query"] = True
+        if pq.kind == MessageIntentKind.CANCEL_WORKFLOW and pq.target_workflow:
+            entities["cancel_workflow_target"] = pq.target_workflow
+        if pq.kind == MessageIntentKind.SHOW_REVIEW and pq.target_workflow:
+            entities["show_workflow_target"] = pq.target_workflow
+        is_greeting = (
+            pq.kind == MessageIntentKind.NEW_WORKFLOW
+            and "greeting" in (pq.reasoning or "").lower()
+        )
+        if pq.kind == MessageIntentKind.CANCEL_WORKFLOW:
+            wf = (pq.target_workflow or "leave").strip().lower()
+            return UnderstandingResult(
+                goal="Cancel workflow",
+                workflow=wf,
+                action=UnderstandingAction.CANCEL.value,
+                confidence=pq.confidence,
+                reasoning=pq.reasoning,
+                source="plan_shortcut",
+                entities=entities,
+            )
+        if pq.kind == MessageIntentKind.SHOW_REVIEW:
+            wf = (pq.target_workflow or "leave").strip().lower()
+            return UnderstandingResult(
+                goal="Show summary",
+                workflow=wf,
+                action=UnderstandingAction.REVIEW.value,
+                confidence=pq.confidence,
+                reasoning=pq.reasoning,
+                source="plan_shortcut",
+                entities=entities,
+            )
+        if pq.kind == MessageIntentKind.OUT_OF_SCOPE:
+            return UnderstandingResult(
+                goal="Out of scope",
+                workflow="none",
+                action=UnderstandingAction.NONE.value,
+                confidence=pq.confidence,
+                reasoning=pq.reasoning or "Off-topic for HR assistant.",
+                source=pq.source or "llm_hr_scope",
+                is_out_of_scope=True,
+                entities=entities,
+            )
         return UnderstandingResult(
+            goal="Greeting" if is_greeting else "",
             workflow="none",
-            action=UnderstandingAction.QUERY.value,
+            action=UnderstandingAction.NONE.value if is_greeting else UnderstandingAction.QUERY.value,
             confidence=pq.confidence,
             reasoning=pq.reasoning,
             source="plan_shortcut",
             entities=entities,
+            is_greeting=is_greeting,
         )
 
     def decide_and_execute_turn(
@@ -693,10 +1201,21 @@ class PendingQuestionEngine:
     def _plan_route_params(
         memory: SessionMemory,
         pq_decision: PendingQuestionDecision,
+        *,
+        understanding: UnderstandingResult | None = None,
     ) -> tuple[PendingQuestionDecision | None, str]:
+        if understanding and understanding.is_greeting:
+            return pq_decision, "pending"
         if pq_decision.kind in _INFORMATIONAL_PRIORITY_KINDS:
             return pq_decision, "pending"
         if pq_decision.kind in _PLATFORM_PQ_KINDS:
+            return pq_decision, "pending"
+        if pq_decision.kind == MessageIntentKind.SHOW_REVIEW:
+            return pq_decision, "pending"
+        if (
+            pq_decision.kind == MessageIntentKind.NEW_WORKFLOW
+            and "greeting" in (pq_decision.reasoning or "").lower()
+        ):
             return pq_decision, "pending"
         if memory.active_workflow:
             return None, "active"
@@ -719,7 +1238,9 @@ class PendingQuestionEngine:
         workflow_pipeline: Any,
         pre_patches: list[dict[str, Any]] | None = None,
     ) -> tuple[str, dict[str, Any]] | None:
-        pq_exec, route_source = PendingQuestionEngine._plan_route_params(memory, pq_decision)
+        pq_exec, route_source = PendingQuestionEngine._plan_route_params(
+            memory, pq_decision, understanding=understanding
+        )
         result = workflow_pipeline.execute_workflow_turn(
             message,
             memory=memory,
@@ -921,6 +1442,25 @@ class PendingQuestionEngine:
                 blocks_new_workflow=bool(pq),
             )
 
+        if (
+            aw
+            and aw.id == "expense"
+            and conf >= 0.65
+            and (
+                understanding.workflow == "leave"
+                or understanding.interrupt_workflow == "leave"
+                or "leave" in (understanding.goal or "").lower()
+            )
+        ):
+            return PendingQuestionDecision(
+                kind=MessageIntentKind.SWITCH_WORKFLOW,
+                confidence=max(conf, 0.85),
+                reasoning=understanding.reasoning or "Leave intent during expense.",
+                source=src,
+                blocks_new_workflow=True,
+                target_workflow="leave",
+            )
+
         if memory.pending_confirmation == "submit" and understanding.action in (
             UnderstandingAction.CONFIRM.value,
             UnderstandingAction.SUBMIT.value,
@@ -982,6 +1522,28 @@ class PendingQuestionEngine:
                 target_workflow=aw.id,
             )
 
+        cancel_target = str((understanding.entities or {}).get("cancel_workflow_target") or "").lower()
+        if not cancel_target and not aw:
+            from chat.services.platform.workflow_cancel import resolve_workflow_cancel_target
+
+            cancel_target = (
+                resolve_workflow_cancel_target(
+                    message,
+                    memory,
+                    conversation_history=None,
+                )
+                or ""
+            )
+        if cancel_target in ("leave", "expense"):
+            return PendingQuestionDecision(
+                kind=MessageIntentKind.CANCEL_WORKFLOW,
+                confidence=max(conf, 0.92),
+                reasoning=understanding.reasoning or f"Cancel {cancel_target} workflow.",
+                source=src,
+                blocks_new_workflow=True,
+                target_workflow=cancel_target,
+            )
+
         if understanding.is_greeting:
             return PendingQuestionDecision(
                 kind=MessageIntentKind.NEW_WORKFLOW,
@@ -1011,6 +1573,29 @@ class PendingQuestionEngine:
                 target_workflow=target if target not in ("none", "") else None,
             )
 
+        show_target = str((understanding.entities or {}).get("show_workflow_target") or "").lower()
+        if not show_target:
+            from chat.services.platform.workflow_show import resolve_workflow_show_target
+
+            show_target = (
+                resolve_workflow_show_target(
+                    message,
+                    memory,
+                    active_workflow_id=aw.id if aw else "",
+                )
+                or ""
+            )
+        if show_target in ("leave", "expense") or understanding.action == UnderstandingAction.REVIEW.value:
+            wf = show_target or understanding.workflow or (aw.id if aw else None)
+            return PendingQuestionDecision(
+                kind=MessageIntentKind.SHOW_REVIEW,
+                confidence=max(conf, 0.86),
+                reasoning=understanding.reasoning or "Summary/review (AI understanding).",
+                source=src,
+                blocks_new_workflow=True,
+                target_workflow=wf if wf not in ("none", "") else None,
+            )
+
         if understanding.is_out_of_scope or is_off_hr_topic_message(message, memory=memory):
             return PendingQuestionDecision(
                 kind=MessageIntentKind.OUT_OF_SCOPE,
@@ -1020,17 +1605,21 @@ class PendingQuestionEngine:
                 blocks_new_workflow=bool(pq),
             )
 
-        if understanding.action == UnderstandingAction.REVIEW.value:
-            return PendingQuestionDecision(
-                kind=MessageIntentKind.SHOW_REVIEW,
-                confidence=max(conf, 0.86),
-                reasoning=understanding.reasoning or "Summary/review (AI understanding).",
-                source=src,
-                blocks_new_workflow=True,
-                target_workflow=understanding.workflow or (aw.id if aw else None),
+        if pq and understanding.answers_pending_field is False:
+            from chat.services.platform.field_extractors.expense import (
+                expense_turn_has_targeted_patches,
             )
 
-        if pq and understanding.answers_pending_field is False:
+            expense_turn = (understanding.entities or {}).get("expense_turn")
+            if expense_turn_has_targeted_patches(expense_turn, memory):
+                return PendingQuestionDecision(
+                    kind=MessageIntentKind.MODIFY_DATA,
+                    confidence=max(conf, 0.88),
+                    reasoning=understanding.reasoning or "Correct existing expense line.",
+                    source=src,
+                    blocks_new_workflow=True,
+                    target_workflow=aw.id if aw else "expense",
+                )
             if is_workflow_show_request(
                 message,
                 workflow_id=(aw.id if aw else pq.workflow_id),
@@ -1071,6 +1660,16 @@ class PendingQuestionEngine:
             )
 
         if understanding.action == UnderstandingAction.MODIFY.value:
+            goal_low = (understanding.goal or "").lower()
+            reasoning_low = (understanding.reasoning or "").lower()
+            if "delete" in goal_low or "delete" in reasoning_low:
+                return PendingQuestionDecision(
+                    kind=MessageIntentKind.DELETE_DATA,
+                    confidence=max(conf, 0.88),
+                    reasoning=understanding.reasoning or "Delete (AI understanding).",
+                    source=src,
+                    blocks_new_workflow=True,
+                )
             return PendingQuestionDecision(
                 kind=MessageIntentKind.MODIFY_DATA,
                 confidence=conf,
@@ -1087,6 +1686,30 @@ class PendingQuestionEngine:
                 source=src,
                 blocks_new_workflow=True,
             )
+
+        from chat.services.platform.field_extractors.expense import (
+            resolve_pending_expense_edit_turn,
+        )
+
+        resolved_edit = resolve_pending_expense_edit_turn(message, memory)
+        if resolved_edit:
+            resolved_intent = str(resolved_edit.get("intent") or "").lower()
+            if resolved_intent == "delete":
+                return PendingQuestionDecision(
+                    kind=MessageIntentKind.DELETE_DATA,
+                    confidence=max(conf, 0.88),
+                    reasoning="Delete confirmation after clarify.",
+                    source=src,
+                    blocks_new_workflow=True,
+                )
+            if resolved_intent in ("modify_review", "update"):
+                return PendingQuestionDecision(
+                    kind=MessageIntentKind.MODIFY_DATA,
+                    confidence=max(conf, 0.88),
+                    reasoning="Modify confirmation after clarify.",
+                    source=src,
+                    blocks_new_workflow=True,
+                )
 
         if _expense_pending_slot_answer(message, memory, understanding):
             pq = memory.pending_question

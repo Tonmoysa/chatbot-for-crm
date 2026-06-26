@@ -66,6 +66,40 @@ def test_enrich_summary_not_slot_answer():
     assert out.field_updates == []
 
 
+def test_enrich_leave_summary_during_expense_submit_review():
+    memory = SessionMemory(
+        active_workflow=ActiveWorkflow(id="expense", stage="confirm_submit", draft_id="expense"),
+        pending_confirmation="submit",
+        workflow_drafts={
+            "expense": WorkflowDraft(
+                workflow_id="expense",
+                fields={
+                    "incurred_date": "2026-06-26",
+                    "items": [{"category": "lunch", "amount": 200.0}],
+                },
+            ),
+            "leave": WorkflowDraft(
+                workflow_id="leave",
+                fields={"reason": "Leave tomorrow", "leave_type": "sick"},
+            ),
+        },
+        suspended_workflows=[
+            {"workflow_id": "leave", "stage": "collecting", "draft_id": "leave", "suspended_at_turn": 12},
+        ],
+    )
+    result = UnderstandingResult(
+        workflow="expense",
+        action=UnderstandingAction.COLLECT.value,
+        confidence=0.55,
+        entities={"expense_intent": "conversation"},
+        field_updates=[],
+    )
+    out = enrich_answers_pending_field("leave er summery ta daw", memory, result)
+    assert out.action == UnderstandingAction.REVIEW.value
+    assert out.workflow == "leave"
+    assert (out.entities or {}).get("show_workflow_target") == "leave"
+
+
 def test_enrich_osusto_is_slot_answer():
     memory = _memory_pending_reason()
     result = UnderstandingResult(

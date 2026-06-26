@@ -44,6 +44,12 @@ validation_rules:
     message_en: "Future dates are not allowed for expenses."
     message_bn: "ভবিষ্যত তারিখ গ্রহণযোগ্য নয়।"
 
+  - id: incurred_date_today_only
+    type: date_must_equal_today
+    params: { field: incurred_date }
+    message_en: "Expense date must be today — backdated claims are not allowed."
+    message_bn: "খরচের তারিখ আজকের হতে হবে — আগের তারিখ গ্রহণযোগ্য নয়।"
+
   - id: min_one_item
     type: min_line_items
     params: { field: items, min: 1 }

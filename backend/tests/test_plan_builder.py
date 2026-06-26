@@ -59,6 +59,43 @@ def test_plan_builder_submit_confirmation():
     assert plan.primary_op == PlanOp.RESOLVE_SUBMIT_CONFIRMATION
 
 
+def test_plan_builder_leave_summary_during_expense_submit():
+    u = UnderstandingResult(
+        workflow="leave",
+        action=UnderstandingAction.REVIEW.value,
+        confidence=0.92,
+        entities={"show_workflow_target": "leave"},
+    )
+    plan = PlanBuilder.build(
+        _ctx(
+            active_workflow_id="expense",
+            active_workflow_stage="confirm_submit",
+            pending_confirmation="submit",
+            has_pending_confirmation=True,
+            user_message="leave er summery ta daw",
+            draft_snapshot={
+                "workflow_id": "expense",
+                "fields": {
+                    "incurred_date": "2026-06-26",
+                    "items": [{"category": "lunch", "amount": 200.0}],
+                },
+            },
+            suspended_workflows=(
+                SuspendedWorkflow(
+                    workflow_id="leave",
+                    stage="collecting",
+                    draft_id="leave",
+                    suspended_at_turn=12,
+                ).to_dict(),
+            ),
+        ),
+        TurnDecision(pq=None, understanding=u, route_source="active"),
+    )
+    assert plan is not None
+    assert plan.primary_op == PlanOp.WORKFLOW_SHOW_REVIEW
+    assert plan.workflow_id == "leave"
+
+
 def test_plan_builder_leave_submit_request():
     u = UnderstandingResult(
         workflow="leave",

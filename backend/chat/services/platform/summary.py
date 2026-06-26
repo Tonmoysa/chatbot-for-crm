@@ -141,6 +141,101 @@ def format_expense_summary(
     return "\n".join(lines)
 
 
+def format_expense_status_report(
+    memory: SessionMemory,
+    *,
+    lang: str = "en",
+    focus_draft: WorkflowDraft | None = None,
+) -> str:
+    """Submitted + open pending expense drafts — full session expense picture."""
+    submitted_rows = list((memory.conversation_facts or {}).get("submitted_expenses") or [])
+    open_drafts: list[WorkflowDraft] = []
+    seen: set[str] = set()
+    for draft_id, draft in (memory.workflow_drafts or {}).items():
+        if not draft or draft.workflow_id != "expense":
+            continue
+        if draft.locked or draft.status == "submitted":
+            continue
+        items = list((draft.fields or {}).get("items") or [])
+        if not items:
+            continue
+        key = str(draft_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        open_drafts.append(draft)
+
+    if focus_draft and not focus_draft.locked and focus_draft not in open_drafts:
+        items = list((focus_draft.fields or {}).get("items") or [])
+        if items:
+            open_drafts.insert(0, focus_draft)
+
+    if not submitted_rows and not open_drafts:
+        if lang == "bn":
+            return (
+                "Apnar kono **expense** shuru hoyni ebong kono submit kora claim o nei.\n\n"
+                "Expense add korte category ar amount bolen — jemon `lunch 120 taka`."
+            )
+        if lang == "banglish":
+            return (
+                "Apnar kono **expense** ekhono shuru hoyni, ar kono submit kora claim o nei.\n\n"
+                "Expense add korte category ar amount bolen — jemon `lunch 120 taka`."
+            )
+        return (
+            "You have not started any **expense** yet, and there are no submitted claims.\n\n"
+            "To add an expense, tell me the category and amount — e.g. `lunch 120 taka`."
+        )
+
+    lines: list[str] = []
+    if lang == "bn":
+        lines.append("**Apnar Expense**")
+    elif lang == "banglish":
+        lines.append("**Apnar Expense**")
+    else:
+        lines.append("**Your Expenses**")
+    lines.append("")
+
+    if submitted_rows:
+        header = "**Submit kora expense**" if lang in ("bn", "banglish") else "**Submitted expenses**"
+        lines.append(header)
+        for row in submitted_rows:
+            if not isinstance(row, dict):
+                continue
+            rid = row.get("request_id") or ""
+            if rid:
+                lines.append(f"- Reference: `{rid}`")
+            for i, item in enumerate(row.get("items") or [], 1):
+                if isinstance(item, dict):
+                    lines.append(f"  {_format_item_line(item, index=i)}")
+        lines.append("")
+
+    if open_drafts:
+        header = "**Pending expense (submit hoyni)**" if lang in ("bn", "banglish") else "**Pending expenses (not submitted)**"
+        lines.append(header)
+        for draft in open_drafts:
+            fields = sync_expense_draft_fields(dict(draft.fields or {}))
+            items = list(fields.get("items") or [])
+            for i, item in enumerate(items, 1):
+                if isinstance(item, dict):
+                    lines.append(_format_item_line(item, index=i))
+            if items:
+                lines.append(f"  **Total: {expense_total(draft):.0f} taka**")
+            incurred = fields.get("incurred_date")
+            if incurred:
+                lines.append(f"  Date: {format_iso_date_display(str(incurred))}")
+            lines.append("")
+
+    if submitted_rows and not open_drafts:
+        extra = (
+            "_Kono open pending expense draft nei — notun expense add korte parben._"
+            if lang in ("bn", "banglish")
+            else "_No open pending draft — you can start a new expense anytime._"
+        )
+        lines.append(extra)
+
+    return "\n".join(lines).strip()
+
+
 def format_expense_collect_recap(
     draft: WorkflowDraft,
     *,

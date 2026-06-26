@@ -153,6 +153,8 @@ def apply_multi_day_scope_to_fields(fields: dict[str, Any], message: str = "") -
 def apply_leave_derived_fields(draft: Any, *, message: str = "") -> None:
     if not draft or draft.workflow_id != "leave" or draft.locked:
         return
+    if scrub_invalid_leave_reason_from_fields(draft.fields):
+        draft.version += 1
     before = draft.fields.get("day_scope")
     updated = apply_multi_day_scope_to_fields(draft.fields, message)
     if updated.get("day_scope") and not before:
@@ -225,12 +227,58 @@ def is_leave_complaint_reason_value(text: str) -> bool:
     return False
 
 
+def is_temporal_or_request_like_leave_reason(text: str) -> bool:
+    """Reason value that is really a date or leave request — not a narrative why."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    low = raw.lower().strip(".")
+    if low in (
+        "tomorrow",
+        "today",
+        "kalke",
+        "kal",
+        "agamikal",
+        "ajke",
+        "leave tomorrow",
+        "leave today",
+        "chuti kalke",
+        "chuti lagbe",
+        "leave lagbe",
+        "amar leave lagbe",
+        "need leave",
+        "want leave",
+    ):
+        return True
+    if "kal theke" in low or "kalke" in low or "agamikal" in low:
+        if len(low.split()) <= 6:
+            return True
+    if low.startswith("leave ") and any(w in low for w in ("tomorrow", "today", "kalke", "kal")):
+        return True
+    if "lagbe" in low and any(w in low for w in ("leave", "chuti", "chhuti")) and len(low.split()) <= 8:
+        return True
+    return False
+
+
+def scrub_invalid_leave_reason_from_fields(fields: dict[str, Any]) -> bool:
+    """Drop bogus reason already on draft — returns True if removed."""
+    reason = fields.get("reason")
+    if not reason:
+        return False
+    if is_garbage_leave_reason_value(str(reason)) or is_temporal_or_request_like_leave_reason(str(reason)):
+        fields.pop("reason", None)
+        return True
+    return False
+
+
 def is_garbage_leave_reason_value(text: str) -> bool:
     """Reject candidate reason VALUES."""
     raw = (text or "").strip()
     if not raw:
         return False
     low = raw.lower().strip(".")
+    if is_temporal_or_request_like_leave_reason(raw):
+        return True
     if low in ("leave", "chuti", "chhuti", "modify", "submit", "cancel", "summary", "review", "yes", "no", "ha"):
         return True
     if low in ("full day", "half day"):
@@ -569,10 +617,14 @@ def _llm_client_configured() -> bool:
     return LLMClient().is_configured()
 
 
+LEAVE_COLLECT_PREFILL_FIELDS = frozenset({"start_date", "end_date"})
+
+
 def _pending_collect_allowed_fields(field: str) -> set[str]:
     allowed = {(field or "").strip()}
     if field == "day_scope":
         allowed.add("half_day_period")
+    allowed.update(LEAVE_COLLECT_PREFILL_FIELDS)
     return {f for f in allowed if f}
 
 
@@ -996,6 +1048,23 @@ def find_submitted_leave_overlap(
         if s and leave_date_ranges_match(str(start_date)[:10], str(end_date)[:10], str(s)[:10], str(e)[:10]):
             return entry
     return None
+
+
+def draft_overlaps_submitted_leave(memory, draft: Any | None = None) -> dict[str, Any] | None:
+    """True when active/passed draft dates collide with a submitted leave range."""
+    if not memory:
+        return None
+    d = draft
+    if d is None:
+        d = memory.active_draft()
+    if not d or getattr(d, "workflow_id", None) != "leave":
+        return None
+    fields = dict(getattr(d, "fields", None) or {})
+    start = fields.get("start_date")
+    if not start:
+        return None
+    end = fields.get("end_date") or start
+    return find_submitted_leave_overlap(memory, str(start), str(end) if end else None)
 
 
 def record_submitted_leave_range(

@@ -93,7 +93,7 @@ CONTEXT RULES
 - After a leave was submitted, user sends NEW dates (e.g. August wedding) → start new leave (action=start), NOT review of old.
 - Long narrative ending in "review dekhao" WITH new dates → start/collect with extracted fields, NOT review-only.
 - Greetings alone → is_greeting=true, action=none.
-- Programming / general knowledge → is_out_of_scope=true ONLY when no active workflow draft.
+- Jokes, life chat, weather, trivia, programming → is_out_of_scope=true even during active leave/expense draft (user is not continuing the form).
 
 FEW-SHOT
 1) pending reason, "leave er summery ta daw" → review, answers_pending_field=false
@@ -212,7 +212,9 @@ Return ONLY valid JSON:
 RULES
 - Answer ONLY the pending_field from context. Do not invent other fields.
 - leave_type: annual, sick, or lwop only. Never casual/personal.
-- start_date/end_date: ISO YYYY-MM-DD — sole date interpreter. kalke/kal/agamikal/tomorrow, 14 july, next monday, ranges from today_iso.
+- start_date/end_date: ISO YYYY-MM-DD — sole date interpreter.
+  ajke=today_iso; kalke/kal/agamikal/tomorrow=today+1 day; porshu/poroshu/porshur=today+2 days; 14 july, next monday, ranges.
+  NEVER set start_date to a date already in submitted_leave_ranges from payload (user already has leave that day).
 - reason: short text; skip/none → empty value.
 - day_scope: full_day or half_day.
 - When start_date and end_date span 2+ days, set day_scope=full_day automatically (do not ask).
@@ -229,6 +231,7 @@ FEW-SHOT
 5) pending reason, "skip" → {"field":"reason","value":""}
 6) pending start_date, "agami 15 august" → {"field":"start_date","value":"2026-08-15"}
 7) pending end_date, "18 july porjonto" → {"field":"end_date","value":"2026-07-18"}
+8) pending start_date, "porshu tar" / "poroshu din" → {"field":"start_date","value":"<today_iso + 2 days>"}
 """
 
 LEAVE_FIELD_EXTRACT_SYSTEM = """Extract leave workflow fields from the user message.
@@ -241,11 +244,14 @@ Return ONLY valid JSON:
 }
 
 RULES
-- Dates as ISO YYYY-MM-DD using today_iso from payload for relative phrases (ajke, kalke, next monday, ranges).
+- Dates as ISO YYYY-MM-DD using today_iso from payload.
+  ajke=today; kalke/kal/agamikal/tomorrow=today+1; porshu/poroshu/porshur din=today+2; explicit calendar dates and ranges.
+- submitted_leave_ranges in payload lists dates already taken — do NOT extract those dates unless user clearly picks a different new date.
 - leave_type: annual, sick, lwop only — omit if unclear or non-canonical (set entities.requested_leave_type instead).
-- reason: ALWAYS extract when user explains why they need leave — even in long narratives.
-  Summarize in one concise phrase (max ~200 chars). Family illness, wedding, village emergency, hospital stay, etc.
-  NEVER use date ranges or "office attend korte parbo na" / unavailability boilerplate as reason.
+- reason: extract ONLY when user gives a real why (illness, wedding, family emergency, travel purpose).
+  NEVER extract reason from bare leave requests or date-only phrases.
+  NEVER use "leave tomorrow", "amar leave lagbe kalke", kalke/kal/agamikal, or date ranges as reason.
+  NEVER use "office attend korte parbo na" / unavailability boilerplate as reason.
 - Extract ALL clearly stated fields in one pass.
 
 FEW-SHOT
@@ -253,6 +259,9 @@ FEW-SHOT
    reason="Grandfather unwell; family emergency in village", leave_type=annual, dates filled, day_scope=full_day
 2) "choto boner biye, 5-9 Aug office parbo na" → reason="Younger sister's wedding", dates filled, leave_type empty unless stated
 3) "baba-r operation, hospital e thakte hobe" → reason="Father's operation; hospital stay", leave_type empty
+4) "amar leave lagbe kalke" → start_date=<tomorrow ISO> only — NO reason field
+5) "kal theke chuti lagbe" / "leave tomorrow" → start_date only — NO reason
+6) "porshu tar leave lagbe" → start_date=<today+2 ISO> only — NO reason; must NOT reuse submitted_leave_ranges dates
 """
 
 LEAVE_REASON_EXTRACT_SYSTEM = """Extract ONLY the leave reason from the user message.
@@ -265,6 +274,7 @@ RULES
 - Summarize why the employee needs leave in one short phrase (max 200 chars).
 - Use family/health/personal context from long Banglish narratives.
 - NEVER return dates, leave type, manager/handover notes, or "office attend korte parbo na" as reason.
+- NEVER return bare leave requests ("amar leave lagbe", "leave tomorrow", "kalke chuti") as reason.
 - If no real reason is stated, return {"reason": ""}.
 
 FEW-SHOT
@@ -308,7 +318,8 @@ INTENTS (user request takes priority)
 - show_list / show_summary / show_total: user wants to see expenses, summary, or total — return intent even if pending_question exists.
 - add: user adds new expense item(s) — action=append patches. **Wins over answer_pending** when message has explicit add phrasing (add koro, jog koro, ar ekta, notun expense) even if a category word appears.
 - update / correct / modify_review: user fixes amount/category/route — action=update with item_index or match_amount; "it was 300" / "280 na 300" → update matching item, NEVER append duplicate.
-- delete: user removes an item — action=delete or delete_indices. "1 no expense delete koro" → delete item_index 0.
+- **Correction phrasing (Banglish):** "jeta bus er 45 taka ota 35 hobe", "45 er jaygay 35 boshao", "oi expense ta vul ache", "ager bus amount ta change koro" → intent=update (or modify_review at review), action=update with match_amount=old amount and amount=new amount — NEVER action=append.
+- delete: user removes an item — action=delete or delete_indices. "1 no expense delete koro" → delete item_index 0. **Entry numbers in delete/modify messages are NEVER amounts** — "3 number bus delete koro" deletes Expense 3 (item_index 2), do NOT append bus 3 taka.
 - clarify_modify: user wants to change something but draft has **multiple matching items** (e.g. two bus lines) OR message is vague ("ami modify korte bolchi", "bus 130 taka" with 2 buses). Do NOT return empty conversation — set clarify.candidate_indices from draft_items.
 - clarify_delete: user wants delete but did not say which entry number.
 - answer_pending: user answers ONLY the pending_question field (single category token, route pair, or amount) — NOT when adding a new line.
@@ -321,8 +332,8 @@ RULES
 - **LLM owns natural language** — interpret Banglish freely; do not require exact keywords. Use draft_items labels (Expense 1 — Bus — 120 taka) to resolve references.
 - When user mentions a category (bus, lunch) and multiple draft_items share it, return clarify_modify with candidate_indices — NEVER guess which one.
 - NEVER lose existing draft items. Merge patches into draft; do not recreate from scratch.
-- NEVER append a duplicate: if category+amount (and route when present) match an existing item, use action=update instead of append.
-- Duplicates ARE allowed when user explicitly adds again ("add koro", "ar ekta", same bus 120 twice) — use action=append.
+- **Repeat / same message again:** user may resend the same expense lines — action=append each time (duplicate line items allowed). Show missing fields after; do NOT use show_list, update, or skip.
+- **Compound message (lunch + bus + bike in one message):** intent=add, one append patch per line — NEVER update item_index on existing rows.
 - Banglish route variants: "mirpur to motijheel/motekheel/motijhil", "X theke Y", "X theke Y porjonto".
 - Banglish summary: "summery", "summery daw", "expense er summery", "list dekhao", "expense e back koro", "expense continue".
 - One message may append multiple items AND update others AND delete — include all patches.
@@ -331,17 +342,24 @@ RULES
 - Travel (bus/train/metro/bike/rickshaw) needs from_location + to_location; do not hallucinate routes.
 - Categories: lunch, snack, bus, train, bike, metro_rail, metro, rickshaw ONLY.
 - Use item_index / item_id from draft_items when user refers to first/second/last or by amount.
-- pending_question in payload: if user answers it, set intent=answer_pending AND include patch for that slot.
+- expense_pending_edit in payload: bot asked which line to change/delete. User intent wins:
+  - New add (category+amount, "add koro", "notun expense") → intent=add, ignore pending edit.
+  - Entry selection ("2", "Expense 2") → apply expense_pending_edit.message to item_index (number−1); intent=modify_review or delete with action=update/delete — NEVER append.
+- pending_question in payload: context only — NEVER choose target item_index from pending_question alone.
+- **Target resolution:** determine item_index ONLY from the current user message + draft_items. If user names a category (bus, lunch, bike), prioritize that category over pending_question.
+- If user mentions a category different from pending_question item, treat as edit/delete on that category — NOT answer_pending.
+- Regret / undo (lagbe nah, vule add, dorkar nah) + category → intent=delete for that category's item(s).
+- answer_pending: user answers ONLY the pending_question field (single category token, route pair, or amount) — NOT when adding, deleting, modifying another line, or showing summary.
 - **CONVERSATION CONTEXT (Phase 1):** Always read conversation_history, recent_user_messages, and last_assistant_message together with message.
 - If user refers to a prior turn ("ami tomake route diyechi", "age diyechi", "already said") → scan recent_user_messages for the missing slot value and apply answer_pending — do NOT append a new item.
 - If user says "add koro" while complaining they already gave route/category → intent=answer_pending or update using prior user message, NOT add.
-- pending_focus in payload: when set, DEFAULT all answer_pending patches to pending_focus.item_index — NEVER append new items unless user clearly adds a new expense ("ar ekta", "notun expense", new amounts).
-- pending_focus.missing_field route → only fill from_location/to_location on that item; do NOT change category.
-- pending_focus.missing_field category → only fill category on that item.
+- pending_focus in payload: context hint only — do NOT default patches to pending_focus.item_index when user targets another line.
+- pending_focus.missing_field route → only fill from_location/to_location when user gives a route answer for THAT item.
+- pending_focus.missing_field category → only fill category when user gives a category answer for THAT item.
 - One message may update MULTIPLE items (e.g. route for expense 1 + category for expense 5) — include all patches.
 - Reference by number: "expense 6 130 taka" / "6 no expense 130" → update item_index 5, amount 130.
 - If user adds new expense while pending_question open, STILL append new items (intent=add) when message clearly introduces new amounts/categories.
-- incurred_date: ISO using today_iso for aj/today/kal.
+- incurred_date: ISO date the user meant. ajke/aj/today or no date → today_iso. kalke/kal/goto kal/yesterday → yesterday ISO. agamikal/porer din/tomorrow → tomorrow ISO. Output the date user asked for even though only today is accepted.
 
 FEW-SHOT
 1) draft has lunch 250, user: "snack 70, bus 120 Mirpur to Agargaon" → append snack + bus with route
@@ -351,7 +369,7 @@ FEW-SHOT
 5) user: "total koto" → show_total
 6) compound: "Aj bus 120, lunch 280, ar 150 taka but category jani na" → append bus, lunch, {amount:150}
 7) pending item_route for bus, user: "mirpur to motekheel" → answer_pending, update item_index with route ONLY
-8) draft already has lunch 280, user repeats lunch 280 → update existing, do NOT append
+8) draft already has lunch 280, user repeats "lunch 280 taka" → intent=add, append lunch 280 again (duplicate line allowed)
 9) user: "expense summery daw" / "expense e back koro" → show_summary, item_patches=[]
 10) pending route expense 1, user: "mirpur to motejheel and category hobe bike" → answer_pending route on item 0 ONLY
 11) user: "expense 6 130 taka" → update item_index 5 amount 130
@@ -366,6 +384,35 @@ FEW-SHOT
 20) user: "bus er expense modify kore 130 taka koro" with two buses → clarify_modify with both bus indices
 21) user: "ami modify korte bolchi" / "ami toh present expense chai ni" → clarify_modify or anti_summary respectively
 22) user: "expense 5 130 taka" → update item_index 4 amount 130
+23) draft has Bus 45, user: "jetar bus er khorose 45 taka ota ashole hobe 35 taka" → intent=update, action=update, match_amount=45, amount=35, category=bus, item_id from matching draft item — NEVER append
+24) pending route for bus expense 3, user: "bike ta ar lagbe nah vule add dyechilam" → delete bike item_index, NOT clarify_modify for bus
+25) pending route for bus, user: "expense er list daw" → show_summary, item_patches=[]
+26) expense_pending_edit modify "bike route mirpur to badda", user: "2" → modify_review, update item_index 1 route Mirpur→Badda — NEVER append
+27) expense_pending_edit active, user: "lunch 200 add koro" → intent=add, append lunch 200
+28) draft has Lunch 100, user: "lunch ta ami vule 100 taka diyechi ashole ota hobe 120 taka" → intent=modify_review, action=update, item_index for lunch, match_amount=100, amount=120 — NEVER 100
+29) user: "kalke lunch 100 bus 120" → intent=add, incurred_date=yesterday ISO, append lunch+bus (system blocks non-today)
+30) user: "lunch 100 taka" (no date) → intent=add, incurred_date=today_iso, append lunch
+"""
+
+EXPENSE_DRAFT_INTERPRETER_SYSTEM_COMPACT = """Expense draft editor — return ONLY JSON:
+{"intent":"add|update|delete|modify_review|confirm|cancel|show_summary|show_list|show_total|answer_pending|clarify_modify|clarify_delete|conversation","incurred_date":"YYYY-MM-DD|null","item_patches":[{"action":"append|update|delete","item_index":0,"category":"lunch|snack|bus|train|bike|metro|rickshaw","amount":100,"from_location":"","to_location":""}],"delete_indices":[],"clarify":{},"reasoning":""}
+
+Rules: interpret Banglish freely; use items[] (i=index, cat, amt, route). **add** → action=append with amount from user message — NEVER set match_amount on append. **update/correct** only when user fixes one existing line (match_amount). Compound multi-item messages → intent=add, append only, no item_index. delete=delete_indices. review stage: modify_review for edits. clarify_modify when multiple matches. conversation ONLY for greeting/chitchat with no draft edit. Categories: lunch, snack, bus, train, bike, metro, rickshaw. incurred_date: user-stated date (today_iso if ajke/unspecified; yesterday ISO for kalke; tomorrow for agamikal). User repeats same items → append again (duplicates OK).
+
+Few-shot:
+- "kalke lunch 100" → add, incurred_date=yesterday ISO, append lunch 100
+- "amar ajke lunch 100" → add, incurred_date=today_iso, append lunch 100
+- "lunch 100" / "lunch 100 taka" → add, append {category:lunch, amount:100} — no match_amount
+- stage submitted, items [] → new expense; "lunch 100 taka" → add, append lunch 100 (ignore prior submitted amounts)
+- "lunch ta vule 100 diyechi ota 120 hobe" → modify_review, update lunch match_amount 100 amount 120
+- "bus 130 hobe" with 2 buses → clarify_modify, candidate_indices
+- "ha" at submit → confirm
+- "submit koro" / "subit koro" (typo) → intent=confirm, no patches
+- "list dekhao" → show_list
+- "3 theke 5 expense delete koro" with items 1..5 listed → delete, delete_indices [2,3,4] (user numbers are 1-based; indices 0-based)
+- "3,4,5 bad dao" → delete_indices [2,3,4]
+- blocked_add in payload + "last expense add koro" / "sheta add koro" → add, append each blocked item (today), submit_after if user asked
+- "vule kalke bolchi ajker khoroch" with blocked_add → add, append blocked items for today_iso (no new amounts in message)
 """
 
 EXPENSE_SLOT_FROM_HISTORY_SYSTEM = """Extract ONE expense slot value from a prior user message.
@@ -391,4 +438,177 @@ When answers_pending_field=false, do NOT route as answer_pending — prefer show
 When answers_pending_field=true and action=collect, route answer_pending.
 Prefer switch_workflow when interrupt_workflow is set and differs from active workflow.
 When pending_confirmation=submit, yes/ha → answer_pending with submit confirm routing.
+"""
+
+SESSION_CONTEXT_REPLY_SYSTEM = """You resolve short or ambiguous user replies using the full chat session — like ChatGPT reading the last bot question and prior user turns.
+
+Return ONLY valid JSON:
+{
+  "resolution": "none|confirm_switch|decline_switch|confirm_expense_start|confirm_leave_submit|decline_leave_submit|resume_suspended|policy_query|out_of_scope|continue_current",
+  "target_workflow": "leave|expense|policy|none|null",
+  "confidence": 0.0-1.0,
+  "reasoning": "one sentence — internal only"
+}
+
+RULES
+- Read last_assistant_message, pending_confirmation, active_workflow, suspended_workflows, conversation_history, and the latest user message together.
+- pending_confirmation like switch:leave:expense + yes/ha/ok/thik → confirm_switch target expense; no/na → decline_switch (stay on leave).
+- Bot asked "Expense claim toiri korbo?" / "create expense claim" and user says yes/ha/ok → confirm_expense_start (even if active workflow is still leave).
+- Bot showed leave submit review ("Reply yes to submit") and user says yes/ha → confirm_leave_submit.
+- User says no/naki after submit review → decline_leave_submit.
+- "expense e fire jao" / "leave e back" with suspended workflow → resume_suspended with matching target_workflow.
+- Company policy / HR policy questions → policy_query.
+- Weather, coding, jokes, unrelated topics → out_of_scope.
+- NEVER confirm_leave_submit or confirm_expense_start for jokes, life chat, stories, or general knowledge — those are out_of_scope.
+- NEVER out_of_scope for leave/expense summary or review: "leave er summery", "leave summary dekhao", "expense list", "summery daw" → resolution=none (workflow show router handles it).
+- If the latest user message is a full new expense or leave request with real data (amounts, dates, categories), return none — let the domain LLM handle it.
+- CRITICAL: Messages listing expense items with amounts (e.g. lunch 100, bus 120, bike 150) are NEW expense claims — resolution MUST be none, NEVER confirm_expense_start or confirm_switch.
+- Short replies only (yes, ha, ok, no, na, 1-3 words) when bot asked a question — not full expense narratives.
+- If unsure or message is not a contextual reply, return resolution=none.
+- Banglish and English confirmations are equivalent: ha/hy/yes/ok/thik ache/ji.
+"""
+
+EXPENSE_TURN_SEMANTICS_SYSTEM = """Expense turn semantics — return ONLY JSON:
+{
+  "date_effect": "today|non_today|unspecified",
+  "date_correction": false,
+  "replay_blocked_add": false,
+  "incurred_date_iso": "YYYY-MM-DD|null",
+  "reasoning": ""
+}
+
+Use today_iso from payload. Interpret Banglish freely.
+
+date_effect:
+- today: ajke/aj/today, or user affirms expenses are for today, or no date mentioned (default today).
+- non_today: kalke/kal/goto kal/yesterday, agamikal/tomorrow/porer din, or explicit past/future ISO ≠ today_iso.
+- unspecified: no date signal and not a correction/replay turn.
+
+date_correction: true when user retracts a non-today date and says it should be TODAY (e.g. "vule kalke bolchi", "ota ajker khoroch", "actually today", "sorry kalke bolchi ajke").
+
+replay_blocked_add: true when user wants a PREVIOUSLY BLOCKED compound add replayed (e.g. "last expense add koro", "sheta add koro", "age je expense bolechilam add koro", "oi expense ta add koro") AND blocked_add in payload is non-empty.
+
+incurred_date_iso: the calendar date the user means for the claim (not necessarily allowed). null if unspecified.
+
+FEW-SHOT
+1) "amar kalke lunch 100 bus 120" → non_today, correction=false, replay=false
+2) "sorry vule kalke diyechi ota ajker khoroch" + blocked_add present → today, date_correction=true, replay_blocked_add=true
+3) "last expense ta add koro" + blocked_add with 3 items → today, replay_blocked_add=true
+4) "lunch 100 taka" → today or unspecified, correction=false, replay=false
+5) "agamikal lunch 100" → non_today
+6) pending route open, user: "mirpur theke gulshan" → unspecified (route answer — not date replay)
+7) "8,9,10 expense delete koro" / "item 3 bad dao" → unspecified, correction=false, replay=false (list numbers are NOT dates)
+8) "bus 120 hobe" / "lunch ta 150 koro" → unspecified (modify — not date add)
+9) "submit koro" / "subit koro" / "please submit" → unspecified, replay_blocked_add=false (submit current draft — NOT replay blocked_add)
+10) blocked_add present but user only says "submit koro" → replay=false (submit ≠ replay blocked compound)
+"""
+
+WORKFLOW_SHOW_TARGET_SYSTEM = """Workflow show/summary routing — return ONLY JSON:
+{
+  "target_workflow": "leave|expense|active|none",
+  "reasoning": ""
+}
+
+User wants to SEE a workflow summary or status — not submit, not add new line items.
+
+target_workflow:
+- leave: user explicitly asks for LEAVE summary/status (leave summery, chuti dekhao, leave er summary, amar leave, where is my leave)
+- expense: user asks for EXPENSE list/summary/total (expense list, khoroch dekhao, ajker expense, expense summary)
+- active: generic summary with no workflow named — use active_workflow from payload
+- none: not a show/summary/navigation request
+
+FEW-SHOT:
+- active=expense, "leave er summery ta daw" → leave
+- active=expense, pending expense submit, "leave summary dekhao" → leave (do NOT show expense)
+- active=expense, "summery dekhao" with no workflow name → active
+- active=leave, "expense list daw" → expense
+- "cancel it" / "cancel this" / "batil koro" → none (cancel router handles it — NOT a summary)
+- "submit koro" → none
+"""
+
+WORKFLOW_CANCEL_TARGET_SYSTEM = """Workflow cancel routing — return ONLY JSON:
+{
+  "is_cancel": true|false,
+  "target_workflow": "leave|expense|active|none",
+  "reasoning": ""
+}
+
+User wants to ABANDON / discard a pending workflow draft — not view a summary.
+
+is_cancel true for:
+- cancel it, cancel this, cancel that, cancel my leave, batil koro, bandho koro, cancel the request
+- explicit "cancel leave" / "expense cancel"
+
+is_cancel false for:
+- leave summery/summary dekhao, expense list, submit koro, add expense lines, modify amounts
+
+target_workflow:
+- leave: cancel leave/chuti draft (including after bot just showed leave summary)
+- expense: cancel expense/khoroch draft
+- active: cancel whichever workflow the last assistant turn was about
+- none: cancel intent but target unclear
+
+FEW-SHOT:
+- last_assistant showed leave summary, user: "cancel it" → is_cancel=true, target_workflow=leave
+- suspended leave+expense, last bot showed leave summary, "cancel it" → leave
+- "leave er summery ta daw" → is_cancel=false
+"""
+
+EXPENSE_DELETE_INDICES_SYSTEM = """Expense delete index resolver — return ONLY JSON:
+{"delete_indices":[0,1],"reasoning":""}
+
+User refers to expense lines with 1-based numbers (expense 1 = index 0). delete_indices must be 0-based.
+
+Expand inclusive ranges: "3 theke 5" / "3 to 5" / "3-5" / "3 theke 5 number" → [2,3,4].
+Lists: "3,4,5 delete" / "8,9,10 bad dao" → all listed numbers minus 1.
+Only return indices where 0 <= index < item_count. Sort ascending. Empty [] if unclear.
+
+FEW-SHOT (item_count=5):
+- "3 theke 5 delete koro" → [2,3,4]
+- "4,5 expense bad dao" → [3,4]
+- "prothom ta delete" → [0]
+"""
+
+HR_ASSISTANT_SCOPE_SYSTEM = """You decide whether a user message belongs in a workplace HR assistant (leave, expense, company policy, greetings, workflow control).
+
+Return ONLY valid JSON:
+{
+  "in_scope": true|false,
+  "category": "leave|expense|policy|greeting|workflow_nav|out_of_scope",
+  "confidence": 0.0-1.0,
+  "reasoning": "one short sentence — internal only"
+}
+
+IN SCOPE (in_scope=true):
+- Leave: sick/annual/lwop, dates, reasons, half/full day, chuti, leave lagbe
+- Expense: amounts, categories, travel routes, khoroch, lunch/bus/bike claims
+- Company policy / HR rules / attendance / WFH questions
+- Greetings and thanks: hi, hello, salam, assalamualaikum, dhonnobad
+- Workflow navigation: summary, review, cancel, submit, switch leave/expense, resume, list dekhao
+- Process questions during a form: "ar ki lagbe", "what else do you need"
+- Short answers to the bot's pending slot question (dates, leave type, reason, amounts)
+
+OUT OF SCOPE (in_scope=false) — even when leave/expense workflow is active:
+- Jokes, riddles, stories: "ekta joke bol", "amake jokes bolba", "funny story"
+- Life philosophy, general advice, random chat: "life somporke kichu bolo", "life er sob theke kharap dik ki"
+- Weather, sports, celebrities, recipes, homework, math trivia
+- Programming, general knowledge unrelated to company HR
+- Anything that does NOT advance leave, expense, policy, or workflow control
+
+CRITICAL
+- A joke or life-chat request during leave collection or submit review is STILL out_of_scope — never treat as leave field answer or submit confirmation.
+- "ha"/"yes" is in_scope ONLY when it clearly confirms the bot's last yes/no question (submit, switch). A long unrelated sentence containing "bol" is NOT confirmation.
+- Full expense/leave narratives with real data → in_scope even if workflow already active.
+
+FEW-SHOT
+1) active leave, pending leave_type, "sick" → in_scope true, leave
+2) active leave, "amake ekta joke bolba" → in_scope false, out_of_scope
+3) active leave, "life somporke kichu bolo" → in_scope false, out_of_scope
+4) active leave submit review, "ha" → in_scope true, workflow_nav
+5) active leave submit review, "amake joke bol" → in_scope false, out_of_scope
+6) "salam" → in_scope true, greeting
+7) "amar kalke sick leave lagbe" → in_scope true, leave
+8) "lunch 200 taka" → in_scope true, expense
+9) "attendance policy ki" → in_scope true, policy
+10) "what is the capital of France" → in_scope false, out_of_scope
 """

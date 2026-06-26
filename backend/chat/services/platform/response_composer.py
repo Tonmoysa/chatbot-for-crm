@@ -370,23 +370,45 @@ class ResponseComposer:
             )
         return lead
 
-    def expense_llm_unavailable(self, *, lang: str = "en") -> str:
-        """When expense LLM failed (rate limit / API busy) — honest free-tier message."""
+    def expense_llm_unavailable(self, *, lang: str = "en", for_edit: bool = False) -> str:
+        """When expense LLM failed (rate limit / API busy) — honest user-facing message."""
+        if for_edit:
+            return localized(
+                lang,
+                en=(
+                    "**AI couldn't process that edit right now** — the language model is "
+                    "unavailable (often API rate limit on the free tier). "
+                    "Wait 1–2 minutes and try again, or send a short line like "
+                    "`lunch 120 taka` or `bike route mirpur to badda`."
+                ),
+                bn=(
+                    "**AI এখন এই edit বুঝতে পারছে না** — language model কাজ করছে না "
+                    "(free tier-এ API limit হলে হয়)। "
+                    "১–২ মিনিট পর আবার চেষ্টা করুন, অথবা ছোট করে লিখুন — "
+                    "যেমন `lunch 120 taka` বা `bike route mirpur to badda`।"
+                ),
+                banglish=(
+                    "**AI ekhon ei edit bujhte parche na** — language model off "
+                    "(free tier e API limit hole hoy). "
+                    "1–2 minute wait kore abar try korun, ba choto kore likhun — "
+                    "jemon `lunch 120 taka` ba `bike route mirpur to badda`."
+                ),
+            )
         return localized(
             lang,
             en=(
-                "**AI failed** — your API limit is used up for now. "
-                "On the free tier, complex messages in one go often hit the limit. "
-                "Wait a minute and try again, or send expenses one line at a time."
+                "**AI is unavailable right now** — API limit reached or the model is busy. "
+                "On the free tier, long messages often hit the limit. "
+                "Wait 1–2 minutes and try again, or send one expense per line."
             ),
             bn=(
-                "**AI কাজ করছে না** — API limit শেষ হয়ে গেছে। "
-                "Free tier-এ একসাথে অনেক কিছু পাঠালে limit চলে যায়। "
+                "**AI এখন কাজ করছে না** — API limit শেষ বা model busy। "
+                "Free tier-এ বড় message পাঠালে limit চলে যায়। "
                 "১–২ মিনিট পর আবার চেষ্টা করুন, অথবা এক লাইনে একটা খরচ লিখুন।"
             ),
             banglish=(
-                "**AI failed** — apnar API limit sesh hoye geche. "
-                "Free tier e ek sathe eto kichu pathale limit chole jay. "
+                "**AI ekhon kaj korche na** — API limit sesh ba model busy. "
+                "Free tier e boro message pathale limit chole jay. "
                 "1–2 minute pore abar try korun, ba ek line e ekta khoroch likhun."
             ),
         )
@@ -431,9 +453,27 @@ class ResponseComposer:
                 bn="**কোন expense delete করব?** entry নম্বর (1, 2, 5…) লিখুন।",
                 banglish="**Kon expense delete korbo?** entry number (1, 2, 5…) likhun.",
             )
+            raw_indices = list(clarify.get("candidate_indices") or turn.get("candidate_indices") or [])
+            if not raw_indices and cat:
+                from chat.services.platform.field_extractors.expense import normalize_expense_category
+
+                norm_cat = normalize_expense_category(cat)
+                raw_indices = [
+                    idx
+                    for idx, item in enumerate(items)
+                    if normalize_expense_category(item.get("category")) == norm_cat
+                ]
+            indices = [
+                int(i)
+                for i in raw_indices
+                if isinstance(i, (int, float)) or str(i).isdigit()
+            ]
+            indices = [i for i in indices if 0 <= i < len(items)]
+            if not indices:
+                indices = list(range(len(items)))
             numbered = [
-                f"{idx + 1}. {expense_item_label(items[idx], index=idx)}"
-                for idx in range(len(items))
+                f"{pos + 1}. {expense_item_label(items[idx], index=idx)}"
+                for pos, idx in enumerate(indices)
             ]
             return f"{lead}\n\n" + "\n".join(numbered)
 
@@ -489,6 +529,79 @@ class ResponseComposer:
         )
         body = self.expense_frustration_reply(memory, message=message, lang=lang)
         return f"{lead}\n\n{body}".strip() if repaired else body
+
+    def expense_past_date_policy(self, *, lang: str = "en") -> str:
+        return self.expense_date_policy_blocked(lang=lang)
+
+    def expense_replay_blocked_ack(self, *, lang: str = "en") -> str:
+        return localized(
+            lang,
+            en="Got it — adding those as **today's** expenses.",
+            bn="ঠিক আছে — **আজকের** হিসেবে add করছি।",
+            banglish="Thik ache — **ajker** hishebe add korchi.",
+        )
+
+    def expense_date_policy_blocked(
+        self,
+        *,
+        lang: str = "en",
+        requested_date: str | None = None,
+    ) -> str:
+        from datetime import date
+
+        today = date.today().isoformat()
+        is_future = bool(
+            requested_date
+            and requested_date > today
+        )
+        if is_future:
+            return localized(
+                lang,
+                en=(
+                    "I can only add **today's** expenses here. "
+                    "Future dates aren't supported — please share today's items."
+                ),
+                bn=(
+                    "আমি এখানে শুধু **আজকের** খরচ add করতে পারি। "
+                    "ভবিষ্যত তারিখ গ্রহণযোগ্য নয় — আজকের item গুলো লিখুন।"
+                ),
+                banglish=(
+                    "Ami ekhane shudhu **ajker** khoroch add korte pari. "
+                    "Porer diner kharcha ekhane add kora jay na — ajker item gulo likhun."
+                ),
+            )
+        return localized(
+            lang,
+            en=(
+                "I can only add **today's** expenses here. "
+                "Yesterday or older dates aren't supported — please share today's items."
+            ),
+            bn=(
+                "আমি এখানে শুধু **আজকের** খরচ add করতে পারি। "
+                "গতকাল বা আগের তারিখ গ্রহণযোগ্য নয় — আজকের item গুলো লিখুন।"
+            ),
+            banglish=(
+                "Ami ekhane shudhu **ajker** khoroch add korte pari. "
+                "Kalke ba ager diner kharcha ekhane add kora jay na — ajker item gulo likhun."
+            ),
+        )
+
+    def expense_already_recorded(self, *, lang: str = "en") -> str:
+        return localized(
+            lang,
+            en=(
+                "These expenses are already on your draft — nothing new was added. "
+                "Share **route** details or any **new items** if you have them."
+            ),
+            bn=(
+                "এই খরচগুলো ইতিমধ্যে draft-এ আছে — আর কিছু add হয়নি। "
+                "**Route** বা **নতুন item** থাকলে লিখুন।"
+            ),
+            banglish=(
+                "Ei kharcha gulo already draft e ache — ar kichu add hoyni. "
+                "**Route** ba **notun item** thakle likhun."
+            ),
+        )
 
     def contextual_review_modify_clarify(
         self,
@@ -642,6 +755,16 @@ class ResponseComposer:
                     lang=lang,
                 )
             return self.contextual_meta_response(memory, lang=lang)
+        expense_intent = str((understanding.entities or {}).get("expense_intent") or "").lower()
+        if (
+            memory
+            and memory.active_workflow
+            and memory.active_workflow.id == "expense"
+            and expense_intent in ("clarify_delete", "clarify_modify")
+        ):
+            turn = dict((understanding.entities or {}).get("expense_turn") or {})
+            turn.setdefault("intent", expense_intent)
+            return self.expense_edit_clarify(memory, turn, lang=lang)
         if memory and (understanding.entities or {}).get("process_question"):
             return self.contextual_process_response(memory, lang=lang)
 
@@ -663,6 +786,13 @@ class ResponseComposer:
             and memory.active_workflow.id == "expense"
             and understanding.answers_pending_field is False
             and understanding.action == UnderstandingAction.CLARIFICATION_NEEDED.value
+            and expense_intent
+            not in (
+                "clarify_delete",
+                "clarify_modify",
+                "date_correction",
+                "replay_blocked_add",
+            )
         ):
             return self.expense_frustration_reply(memory, message="", lang=lang)
         if (
@@ -716,6 +846,13 @@ class ResponseComposer:
                 banglish="Mone hocche apni chuti nite chan. **Leave request** shuru korbo?",
             )
         if wf == "expense":
+            if memory and memory.active_workflow and memory.active_workflow.id == "expense":
+                draft = memory.active_draft()
+                if draft and (
+                    (draft.fields or {}).get("items")
+                    or memory.pending_question
+                ):
+                    return self.contextual_pending_clarify(memory, lang=lang)
             return localized(
                 lang,
                 en="I think this may be an expense entry. Would you like to create an **expense claim**?",
@@ -928,32 +1065,64 @@ class ResponseComposer:
     def leave_status_report(self, memory: SessionMemory, *, lang: str = "en") -> str:
         """Pending draft plus any submitted leave ranges recorded this session."""
         from chat.services.platform.field_engine import leave_draft_in_progress
+        from chat.services.platform.workflow_show import session_leave_draft
 
         parts: list[str] = []
-        draft = memory.active_draft()
-        if draft and draft.workflow_id == "leave":
-            if draft.locked or leave_draft_in_progress(draft):
-                parts.append(self.leave_summary(draft, lang=lang))
+        draft = session_leave_draft(memory)
+        if draft and (
+            draft.locked
+            or leave_draft_in_progress(draft)
+            or (draft.fields or {}).get("reason")
+        ):
+            parts.append(self.leave_summary(draft, lang=lang))
 
         current_ref = str(draft.submitted_request_id or "") if draft and draft.locked else ""
+        seen_ranges: set[tuple[str, str]] = set()
         for entry in (memory.conversation_facts or {}).get("submitted_leave_ranges") or []:
             if not isinstance(entry, dict):
                 continue
             rid = str(entry.get("request_id") or "")
             if rid and rid == current_ref:
                 continue
+            start = str(entry.get("start_date") or "")[:10]
+            end = str(entry.get("end_date") or entry.get("start_date") or "")[:10]
+            key = (start, end)
+            if not start or key in seen_ranges:
+                continue
+            seen_ranges.add(key)
             parts.append(self._submitted_range_summary(entry, lang=lang))
 
         if not parts:
+            submitted = list((memory.conversation_facts or {}).get("submitted_leave_ranges") or [])
+            if submitted:
+                seen_ranges: set[tuple[str, str]] = set()
+                for entry in submitted:
+                    if not isinstance(entry, dict):
+                        continue
+                    start = str(entry.get("start_date") or "")[:10]
+                    end = str(entry.get("end_date") or entry.get("start_date") or "")[:10]
+                    key = (start, end)
+                    if not start or key in seen_ranges:
+                        continue
+                    seen_ranges.add(key)
+                    parts.append(self._submitted_range_summary(entry, lang=lang))
+                if parts:
+                    return "\n\n---\n\n".join(parts) if len(parts) > 1 else parts[0]
             if not memory.active_workflow:
-                if lang == "bn":
-                    return (
-                        "এখন কোনো active leave draft নেই। "
-                        "নতুন leave শুরু করতে বলুন, অথবা আগে submit করা leave এর reference দিন।"
-                    )
-                return (
-                    "There is no active leave draft. "
-                    "Say if you'd like to start a new leave, or share a submitted leave reference."
+                return localized(
+                    lang,
+                    en=(
+                        "I couldn't find a leave summary in this session. "
+                        "Start a new leave or share a submitted leave reference."
+                    ),
+                    bn=(
+                        "এই সেশনে leave সারাংশ খুঁজে পাচ্ছি না। "
+                        "নতুন leave শুরু করুন, অথবা submit করা leave এর reference দিন।"
+                    ),
+                    banglish=(
+                        "Apnar leave summery khuje pacchi nah ei session e. "
+                        "Notun leave shuru korte bolun, ba submit kora leave er reference din."
+                    ),
                 )
             return self.no_open_draft("leave", lang=lang)
         if len(parts) == 1:
@@ -1386,10 +1555,16 @@ class ResponseComposer:
         *,
         lang: str = "en",
         emphasize_total: bool = False,
+        memory: SessionMemory | None = None,
     ) -> str:
         """Informational summary turn — uses ``format_*_summary``, not ``build_review``."""
         if definition.workflow_id == "expense":
-            msg = format_expense_summary(draft, lang=lang)
+            from chat.services.platform.summary import format_expense_status_report
+
+            if memory is not None:
+                msg = format_expense_status_report(memory, lang=lang, focus_draft=draft)
+            else:
+                msg = format_expense_summary(draft, lang=lang)
             if emphasize_total:
                 msg += f"\n\n**Total: {expense_total(draft):.0f} taka**"
             return msg

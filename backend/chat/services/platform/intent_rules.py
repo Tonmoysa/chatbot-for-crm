@@ -51,6 +51,28 @@ _BARE_SUBMIT_RE = re.compile(
     re.I | re.UNICODE,
 )
 
+_BANGLISH_SUBMIT_PHRASES = (
+    "submit kore daw",
+    "submit kore dao",
+    "submit kore de",
+    "submit kore den",
+    "submit koro daw",
+    "submit kore",
+    "joma kore daw",
+    "please submit kore",
+    "eta submit kore",
+)
+
+
+def message_has_banglish_submit_phrase(message: str) -> bool:
+    """Banglish submit phrasing — substring match, no new regex."""
+    low = (message or "").strip().lower()
+    if not low:
+        return False
+    if "submit" not in low and "joma" not in low:
+        return False
+    return any(phrase in low for phrase in _BANGLISH_SUBMIT_PHRASES)
+
 _SUMMARY_RE = re.compile(
     r"\b(summary|summery|dekhao|show|review|total|report|reporting|status\s*report)\b|"
     r"(summary\s*dekhao|summery\s*dekhao|summery\s*ta|total\s*koto|koto\s*hoise|"
@@ -217,6 +239,10 @@ def is_resume_workflow_request(message: str, *, workflow_id: str) -> bool:
             return False
         return bool(_RESUME_LEAVE_RE.search(message or ""))
     if workflow_id == "expense":
+        from chat.services.platform.field_extractors.expense import is_expense_draft_mutation_message
+
+        if is_expense_draft_mutation_message(message):
+            return False
         if is_expense_navigation_message(message) and is_pure_expense_navigation(message):
             return True
         return bool(re.search(
@@ -403,20 +429,27 @@ def is_off_hr_topic_message(message: str, *, memory=None) -> bool:
 
 
 def parse_submit_workflow(message: str, *, active_workflow_id: str | None = None) -> str | None:
-    m = _SUBMIT_RE.search(message or "")
+    raw = (message or "").strip()
+    low = re.sub(r"\bsubi?t\b", "submit", raw.lower(), flags=re.I)
+    m = _SUBMIT_RE.search(low)
     if not m:
-        if re.search(r"\bexpense\s+submit\b", (message or "").lower()):
+        if re.search(r"\bexpense\s+submit\b", low):
             return "expense"
-        if re.search(r"\bleave\s+submit\b", (message or "").lower()):
+        if re.search(r"\bleave\s+submit\b", low):
             return "leave"
     else:
         for g in m.groups():
             if g:
                 return g.lower()
     active = (active_workflow_id or "").strip().lower()
-    if active in ("leave", "expense") and _BARE_SUBMIT_RE.search(message or ""):
+    bare_submit = (
+        _BARE_SUBMIT_RE.search(low)
+        or message_has_banglish_submit_phrase(low)
+        or bool(re.search(r"\bsubmit\b", low) and re.search(r"\b(koro|kor|dao|daw|de|den)\b", low))
+    )
+    if active in ("leave", "expense") and bare_submit:
         return active
-    if active == "claim" and _BARE_SUBMIT_RE.search(message or ""):
+    if active == "claim" and bare_submit:
         return "expense"
     return None
 
@@ -489,6 +522,10 @@ def should_resume_expense_for_list(
 
 def is_expense_navigation_message(message: str) -> bool:
     """User wants to view or resume a suspended/active expense draft."""
+    from chat.services.platform.field_extractors.expense import is_expense_draft_mutation_message
+
+    if is_expense_draft_mutation_message(message):
+        return False
     low = (message or "").strip().lower()
     if not low:
         return False
@@ -636,6 +673,10 @@ def should_route_expense_after_submitted_leave(
     """Post-submit leave on screen — expense messages must start expense, not lock."""
     if not draft_locked or (active_workflow_id or "").strip().lower() != "leave":
         return False
+    from chat.services.platform.turn_semantics import is_expense_review_request
+
+    if is_expense_review_request(message, understanding):
+        return False
     if is_expense_message(message) and not is_leave_message(message):
         return True
     if understanding is not None:
@@ -680,6 +721,10 @@ def is_workflow_show_request(message: str, *, workflow_id: str | None = None) ->
     if not raw:
         return False
     if workflow_id == "expense":
+        from chat.services.platform.field_extractors.expense import is_expense_draft_mutation_message
+
+        if is_expense_draft_mutation_message(message):
+            return False
         from chat.services.platform.field_extractors.expense import is_expense_anti_summary_request
 
         if is_expense_anti_summary_request(raw):
@@ -695,6 +740,11 @@ def is_workflow_show_request(message: str, *, workflow_id: str | None = None) ->
     if is_summary_request(raw) or is_total_request(raw):
         if workflow_id == "leave" and is_expense_navigation_message(raw):
             return False
+        if workflow_id == "expense":
+            import re
+
+            if re.search(r"\b(leave|chuti|chhuti|ছুটি)\b", raw, re.I):
+                return False
         return True
     if workflow_id and is_resume_workflow_request(raw, workflow_id=workflow_id):
         return True
@@ -825,6 +875,13 @@ def infer_new_workflow_target(message: str) -> str | None:
     return None
 
 
+_CONTEXTUAL_CANCEL_RE = re.compile(
+    r"^\s*(?:cancel|batil|bandho|abort|discard|stop)"
+    r"(?:\s+(?:it|this|that|the\s+request|my\s+request))?\s*\.?$",
+    re.I | re.UNICODE,
+)
+
+
 _CANCEL_WORKFLOW_RE = re.compile(
     r"(?:"
     r"\b(?:cancel|abort|discard|stop|bandho|batil|বাতিল)\b.{0,30}\b(?:leave|chuti|chhuti|request|ছুটি|expense|claim|khoroch|খরচ)\b|"
@@ -840,6 +897,8 @@ def is_cancel_workflow_message(message: str, *, workflow_id: str | None = None) 
     raw = (message or "").strip()
     if not raw:
         return False
+    if _CONTEXTUAL_CANCEL_RE.match(raw):
+        return True
     if workflow_id and workflow_id not in ("leave", "expense"):
         return False
     if workflow_id and _BARE_CANCEL_RE.match(raw):
@@ -874,7 +933,17 @@ _DELETE_HINT_RE = re.compile(
 
 
 def is_modify_request(message: str) -> bool:
-    return bool(_MODIFY_HINT_RE.search(message or ""))
+    """Draft edit phrasing — not compound expense narratives or submit requests."""
+    raw = (message or "").strip()
+    if not raw:
+        return False
+    if message_has_banglish_submit_phrase(raw):
+        return False
+    low = raw.lower()
+    # Multiple amounts → narrative add (substring count — avoids parse_amount recursion).
+    if low.count(" taka") + low.count(" tk") + low.count("টাকা") >= 2:
+        return False
+    return bool(_MODIFY_HINT_RE.search(raw))
 
 
 def is_delete_request(message: str) -> bool:

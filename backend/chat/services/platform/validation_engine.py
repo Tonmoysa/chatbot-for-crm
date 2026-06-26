@@ -119,6 +119,16 @@ class ValidationEngine:
                 except ValueError:
                     pass
 
+        if rtype == "date_must_equal_today":
+            field = p.get("field")
+            val = draft.fields.get(field)
+            if val:
+                try:
+                    if date.fromisoformat(str(val)[:10]) != date.today():
+                        return rule.message_bn if lang == "bn" else rule.message_en
+                except ValueError:
+                    return rule.message_bn if lang == "bn" else rule.message_en
+
         if rtype == "min_line_items":
             items = draft.fields.get(p.get("field")) or []
             if len(items) < int(p.get("min", 1)):

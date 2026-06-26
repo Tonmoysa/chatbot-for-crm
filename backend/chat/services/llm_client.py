@@ -19,6 +19,12 @@ _JSON_CIRCUIT_THRESHOLD = 3
 # fall back to rules immediately instead of burning latency on doomed retries.
 _RATE_LIMIT_TRIPPED: set[str] = set()
 
+# One expense-draft LLM per chat turn — understanding must not re-call interpret.
+_EXPENSE_LLM_DONE: set[str] = set()
+
+# Successful expense-draft parse for this trace (reuse when a second caller hits expense_llm_done).
+_EXPENSE_TURN_CACHE: dict[str, dict[str, Any]] = {}
+
 
 def _circuit_key(trace_id: str, scope: str = "default") -> str:
     """Scoped circuit id — understanding vs expense-draft do not share one 429 trip."""
@@ -40,11 +46,49 @@ def llm_rate_limit_active(trace_id: str = "", scope: str = "expense-draft") -> b
     return False
 
 
+def expense_llm_done(trace_id: str = "") -> bool:
+    """True after expense-draft LLM ran (or was satisfied) for this trace."""
+    key = (trace_id or "").strip()
+    return bool(key) and key in _EXPENSE_LLM_DONE
+
+
+def mark_expense_llm_done(trace_id: str = "") -> None:
+    key = (trace_id or "").strip()
+    if not key:
+        return
+    _EXPENSE_LLM_DONE.add(key)
+
+
+def stash_expense_turn_cache(trace_id: str, turn: dict[str, Any]) -> None:
+    key = (trace_id or "").strip()
+    if not key or not isinstance(turn, dict) or not turn:
+        return
+    _EXPENSE_TURN_CACHE[key] = dict(turn)
+
+
+def peek_expense_turn_cache(trace_id: str = "") -> dict[str, Any] | None:
+    key = (trace_id or "").strip()
+    if not key:
+        return None
+    cached = _EXPENSE_TURN_CACHE.get(key)
+    return dict(cached) if isinstance(cached, dict) else None
+
+
+def clear_expense_turn_cache(trace_id: str = "") -> None:
+    key = (trace_id or "").strip()
+    if not key:
+        _EXPENSE_TURN_CACHE.clear()
+        return
+    _EXPENSE_TURN_CACHE.pop(key, None)
+
+
 def clear_llm_trace_state(trace_id: str = "") -> None:
     """Reset per-trace LLM failure counters / circuits (call once per chat turn)."""
     if not trace_id:
         _JSON_HTTP_FAILURES.clear()
         _RATE_LIMIT_TRIPPED.clear()
+        _EXPENSE_LLM_DONE.clear()
+        _EXPENSE_TURN_CACHE.clear()
         return
     key = trace_id.strip()
     for ck in list(_JSON_HTTP_FAILURES.keys()):
@@ -53,6 +97,26 @@ def clear_llm_trace_state(trace_id: str = "") -> None:
     for ck in list(_RATE_LIMIT_TRIPPED):
         if ck == key or ck.startswith(f"{key}:"):
             _RATE_LIMIT_TRIPPED.discard(ck)
+    _EXPENSE_LLM_DONE.discard(key)
+    _EXPENSE_TURN_CACHE.pop(key, None)
+    try:
+        from chat.services.platform.field_extractors.expense import clear_expense_semantics_cache
+
+        clear_expense_semantics_cache(key)
+    except Exception:
+        pass
+    try:
+        from chat.services.platform.workflow_show import clear_workflow_show_cache
+
+        clear_workflow_show_cache(key)
+    except Exception:
+        pass
+    try:
+        from chat.services.platform.workflow_cancel import clear_workflow_cancel_cache
+
+        clear_workflow_cancel_cache(key)
+    except Exception:
+        pass
 
 
 def _rate_limit_tripped(circuit_id: str) -> bool:
@@ -68,8 +132,8 @@ def _retry_after_seconds(exc: Exception) -> float | None:
         body = ""
     m = re.search(r"try again in ([\d.]+)\s*s", body, re.I)
     if m:
-        return min(float(m.group(1)) + 0.5, 35.0)
-    return 2.5
+        return min(float(m.group(1)) + 0.5, 12.0)
+    return 2.0
 
 
 def _maybe_trip_rate_limit(circuit_id: str, exc: Exception) -> None:
@@ -79,6 +143,13 @@ def _maybe_trip_rate_limit(circuit_id: str, exc: Exception) -> None:
         if circuit_id not in _RATE_LIMIT_TRIPPED:
             logger.warning("llm_rate_limit_circuit_open circuit_id=%s", circuit_id)
         _RATE_LIMIT_TRIPPED.add(circuit_id)
+        # Trip all scopes for this trace — another scope would 429 as well.
+        base = circuit_id.split(":", 1)[0]
+        if base:
+            _RATE_LIMIT_TRIPPED.add(base)
+            _RATE_LIMIT_TRIPPED.add(f"{base}:understanding")
+            _RATE_LIMIT_TRIPPED.add(f"{base}:expense-draft")
+            _RATE_LIMIT_TRIPPED.add(f"{base}:default")
 
 
 def _http_error_detail(exc: Exception) -> str:
