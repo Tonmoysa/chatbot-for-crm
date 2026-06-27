@@ -799,6 +799,20 @@ class PlanBuilder:
                 workflow_id="expense",
             )
 
+        submit_wf_early = parse_submit_workflow(message, active_workflow_id=workflow_id)
+        if submit_wf_early == workflow_id or (
+            u.action in (
+                UnderstandingAction.CONFIRM.value,
+                UnderstandingAction.SUBMIT.value,
+            )
+            and (u.workflow or workflow_id) == workflow_id
+        ):
+            return ExecutionPlan(
+                ops=[PlanOp.RESOLVE_SUBMIT_CONFIRMATION],
+                reason="confirm during submit review",
+                workflow_id=workflow_id,
+            )
+
         if cls._is_cross_workflow_interrupt(ctx, u) and not cls._is_expense_review_edit(
             ctx, u, message
         ):
@@ -826,9 +840,12 @@ class PlanBuilder:
                 workflow_id=workflow_id,
             )
 
-        expense_intent = str((u.entities or {}).get("expense_intent") or "").lower()
         submit_wf = parse_submit_workflow(message, active_workflow_id=workflow_id)
-        if submit_wf == workflow_id or expense_intent in ("confirm", "submit"):
+        confirm_on_active = u.action in (
+            UnderstandingAction.CONFIRM.value,
+            UnderstandingAction.SUBMIT.value,
+        ) and (u.workflow or workflow_id) == workflow_id
+        if submit_wf == workflow_id or confirm_on_active:
             return ExecutionPlan(
                 ops=[PlanOp.RESOLVE_SUBMIT_CONFIRMATION],
                 reason="submit phrase during pending review",
@@ -842,7 +859,7 @@ class PlanBuilder:
                 return cls._build_workflow_active(workflow_id, ctx, decision, u)
 
         if workflow_id == "expense":
-            intent = expense_intent
+            intent = str((u.entities or {}).get("expense_intent") or "").lower()
             from chat.services.platform.intent_rules import (
                 is_compound_expense_message,
                 is_expense_message,
@@ -1969,6 +1986,7 @@ class WorkflowPipeline:
                 state=state,
             )
         elif op == PlanOp.REPLY_POLICY:
+            self._pause_active_workflow_for_interrupt(state)
             result = self._reply_policy(
                 message,
                 memory=memory,
@@ -1980,6 +1998,7 @@ class WorkflowPipeline:
                 state=state,
             )
         elif op == PlanOp.REPLY_STATUS:
+            self._pause_active_workflow_for_interrupt(state)
             result = self._reply_status(
                 message,
                 memory=memory,
@@ -2026,6 +2045,7 @@ class WorkflowPipeline:
         elif op == PlanOp.REPLY_GENERAL_HELP:
             result = self._reply_general_help(understanding=understanding, lang=lang)
         elif op == PlanOp.REPLY_TODAY_DATE:
+            self._pause_active_workflow_for_interrupt(state)
             result = self._reply_today_date(
                 memory=memory,
                 ctx=ctx,
@@ -2514,8 +2534,11 @@ class WorkflowPipeline:
         )
 
         if expense_message_requests_submit(message, active_workflow_id=active_id):
-            clear_expense_blocked_add(memory)
-            return self._request_submit(memory, defn, lang=lang, state=state)
+            from chat.services.platform.field_extractors.expense import message_has_new_expense_items
+
+            if not u.field_updates and not message_has_new_expense_items(message):
+                clear_expense_blocked_add(memory)
+                return self._request_submit(memory, defn, lang=lang, state=state)
 
         from chat.services.platform.field_extractors.expense import (
             interpret_expense_turn_semantics,
@@ -2587,11 +2610,45 @@ class WorkflowPipeline:
                 memory, defn, lang=lang, prefix=prefix, state=state
             )
 
-        if intent == "llm_unavailable" or expense_turn_llm_blocked(expense_turn, memory):
+        has_understood_review_edit = bool(u.field_updates) and intent in (
+            "update",
+            "modify_review",
+            "correct",
+            "fix_mistake",
+            "delete",
+        )
+        if intent == "llm_unavailable" or (
+            expense_turn_llm_blocked(expense_turn, memory) and not has_understood_review_edit
+        ):
             from chat.services.platform.field_extractors.expense import (
                 _try_wizard_fallback_turn,
+                coerce_pending_expense_turn,
                 expense_turn_to_field_updates,
             )
+
+            coerced_pending = coerce_pending_expense_turn(message, memory)
+            if coerced_pending and coerced_pending.get("item_patches"):
+                _, pending_updates = expense_turn_to_field_updates(
+                    message,
+                    memory,
+                    trace_id=trace_id,
+                    conversation_history=conversation_history,
+                    expense_turn=coerced_pending,
+                )
+                if pending_updates:
+                    return self._finish_expense_update_turn(
+                        memory,
+                        defn,
+                        updates=list(pending_updates),
+                        message=message,
+                        lang=lang,
+                        state=state,
+                        was_submit=was_submit,
+                        rules_applied=["EXPENSE_PENDING_ROUTE"],
+                        conversation_history=conversation_history,
+                        trace_id=trace_id,
+                        understanding=u,
+                    )
 
             wizard = _try_wizard_fallback_turn(message, memory)
             if wizard and wizard.get("item_patches"):
@@ -2883,19 +2940,14 @@ class WorkflowPipeline:
         ):
             from chat.services.platform.field_extractors.expense import _llm_client_configured
 
-            if _llm_client_configured() or is_expense_draft_mutation_message(message, memory):
-                body = self.composer.expense_llm_unavailable(lang=lang, for_edit=True)
-                if was_submit and draft:
-                    sync_expense_draft(draft)
-                    review_text, _ = self.review.prepare_review(memory, defn, lang=lang)
-                    if review_text:
-                        body = f"{body}\n\n{review_text}".strip()
-                return body, {
-                    "outcome": "NEEDS_INPUT",
-                    "rules_applied": ["EXPENSE_LLM_UNAVAILABLE"],
-                    "awaiting_confirmation": was_submit,
-                }
-            parsed = parse_modify_request(message, list(draft.fields.get("items") or []))
+            items = list(draft.fields.get("items") or [])
+            prefer_llm = bool(_llm_client_configured())
+            parsed = parse_modify_request(
+                message,
+                items,
+                trace_id=trace_id,
+                prefer_llm=prefer_llm,
+            )
             if parsed and parsed.get("needs_clarify"):
                 turn = {
                     "intent": "clarify_modify",
@@ -2912,7 +2964,7 @@ class WorkflowPipeline:
                     "outcome": "NEEDS_CLARIFICATION",
                     "rules_applied": ["EXPENSE_MODIFY_CLARIFY"],
                 }
-            if parsed and parsed.get("amount") is not None:
+            if parsed and parsed.get("amount") is not None and parsed.get("item_index") is not None:
                 body: dict[str, Any] = {"amount": float(parsed["amount"])}
                 if parsed.get("category"):
                     body["category"] = parsed["category"]
@@ -2935,6 +2987,18 @@ class WorkflowPipeline:
                     trace_id=trace_id,
                     understanding=u,
                 )
+            if prefer_llm or is_expense_draft_mutation_message(message, memory):
+                body = self.composer.expense_llm_unavailable(lang=lang, for_edit=True)
+                if was_submit and draft:
+                    sync_expense_draft(draft)
+                    review_text, _ = self.review.prepare_review(memory, defn, lang=lang)
+                    if review_text:
+                        body = f"{body}\n\n{review_text}".strip()
+                return body, {
+                    "outcome": "NEEDS_INPUT",
+                    "rules_applied": ["EXPENSE_LLM_UNAVAILABLE"],
+                    "awaiting_confirmation": was_submit,
+                }
 
         if not u.field_updates and (
             is_expense_message(message) or is_compound_expense_message(message)
@@ -3182,6 +3246,56 @@ class WorkflowPipeline:
             from chat.services.platform.intent_rules import is_delete_request, is_modify_request
 
             if (u.entities or {}).get("expense_llm_degraded") and not u.field_updates:
+                pq_degraded = memory.pending_question
+                answering_pending_slot = bool(
+                    u.answers_pending_field
+                    or (
+                        pq_degraded
+                        and pq_degraded.workflow_id == "expense"
+                        and not is_modify_request(message)
+                        and not is_delete_request(message)
+                    )
+                )
+                if answering_pending_slot:
+                    from chat.services.platform.field_extractors.expense import (
+                        coerce_pending_expense_turn,
+                        expense_turn_to_field_updates,
+                    )
+
+                    coerced_pending = coerce_pending_expense_turn(message, memory)
+                    if coerced_pending and coerced_pending.get("item_patches"):
+                        _, pending_updates = expense_turn_to_field_updates(
+                            message,
+                            memory,
+                            trace_id=trace_id,
+                            conversation_history=conversation_history,
+                            expense_turn=coerced_pending,
+                        )
+                        if pending_updates:
+                            return self._finish_expense_update_turn(
+                                memory,
+                                defn,
+                                updates=_review_safe_updates(list(pending_updates)),
+                                message=message,
+                                lang=lang,
+                                state=state,
+                                was_submit=was_submit,
+                                rules_applied=["EXPENSE_PENDING_ROUTE"],
+                                conversation_history=conversation_history,
+                                trace_id=trace_id,
+                                understanding=u,
+                            )
+                    if pq_degraded:
+                        body = self.composer.slot_still_needed(
+                            pq_degraded.field,
+                            pq_degraded.prompt or "",
+                            lang=lang,
+                        )
+                        return body, {
+                            "outcome": "NEEDS_INPUT",
+                            "rules_applied": ["EXPENSE_PENDING_SLOT_RETRY"],
+                        }
+
                 body = self.composer.expense_llm_unavailable(
                     lang=lang,
                     for_edit=bool(
@@ -4663,8 +4777,13 @@ class WorkflowPipeline:
         lang: str,
         state: StatePatchBuffer | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        from chat.services.platform.field_extractors.expense import memory_has_expense_draft
+        from chat.services.platform.workflow_show import session_expense_draft
+
         draft = memory.active_draft()
-        if defn.workflow_id == "expense" and draft:
+        if defn.workflow_id == "expense" and memory_has_expense_draft(memory):
+            if not draft:
+                draft = session_expense_draft(memory)
             return self.composer.workflow_summary(defn, draft, lang=lang, memory=memory), {
                 "outcome": "INFORMATIONAL"
             }
@@ -4942,11 +5061,15 @@ class WorkflowPipeline:
         }
 
     @staticmethod
-    def _pause_for_oos(state: StatePatchBuffer) -> None:
-        memory = state._memory
-        draft = memory.active_draft()
-        if memory.active_workflow and (not draft or not draft.locked):
+    def _pause_active_workflow_for_interrupt(state: StatePatchBuffer) -> None:
+        from chat.services._policy_interrupt import should_pause_workflow_for_informational
+
+        if should_pause_workflow_for_informational(state._memory):
             state.push("suspend_active_workflow")
+
+    @staticmethod
+    def _pause_for_oos(state: StatePatchBuffer) -> None:
+        WorkflowPipeline._pause_active_workflow_for_interrupt(state)
 
     def _maybe_workflow_switch_confirm(
         self,

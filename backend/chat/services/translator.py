@@ -328,6 +328,7 @@ def align_policy_answer_language(
     *,
     user_message: str,
     trace_id: str,
+    target_lang: str | None = None,
     llm: LLMClient | None = None,
 ) -> str:
     """
@@ -336,7 +337,7 @@ def align_policy_answer_language(
     """
     if not (answer or "").strip():
         return answer
-    target = detect_reply_language(user_message)
+    target = target_lang or detect_reply_language(user_message)
     current = detect_content_language(answer)
     if target == current:
         return answer

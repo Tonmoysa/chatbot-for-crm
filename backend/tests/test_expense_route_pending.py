@@ -196,6 +196,109 @@ def test_dhanmondi_to_mirpur_route_coerced_without_llm():
     assert "route" not in (bus.get("missing_fields") or [])
 
 
+def test_mirpur_to_office_route_applies_without_llm():
+    """Pending route answer 'mirpur to office' must apply when LLM is rate-limited."""
+    from chat.services.platform.field_extractors.expense import (
+        coerce_pending_expense_turn,
+        expense_turn_to_field_updates,
+        sync_expense_draft,
+    )
+    from chat.services.platform.field_engine import FieldEngine
+    from tests.helpers.yaml_scenario_runner import llm_disabled
+
+    memory = _expense_route_pending_memory()
+    memory.pending_question.prompt = (
+        "Expense 4 — Bus — 30.0 taka: where did you travel from and to?"
+    )
+    memory.pending_question.item_index = 3
+    memory.workflow_drafts["default"].fields["items"] = [
+        {
+            "category": "bus",
+            "amount": 30.0,
+            "status": "complete",
+            "from_location": "Kamlapur",
+            "to_location": "Dhanmondi",
+        },
+        {"category": "lunch", "amount": 120.0, "status": "complete"},
+        {
+            "category": "bike",
+            "amount": 130.0,
+            "status": "complete",
+            "from_location": "Dhanmondi",
+            "to_location": "Mirpur",
+        },
+        {"category": "bus", "amount": 30.0, "missing_fields": ["route"], "status": "incomplete"},
+    ]
+
+    turn = coerce_pending_expense_turn("mirpur to office", memory)
+    assert turn is not None
+    assert turn.get("intent") == "answer_pending"
+    patch = turn["item_patches"][0]
+    assert patch.get("item_index") == 3
+    assert patch.get("from_location") == "Mirpur"
+    assert patch.get("to_location") == "Office"
+
+    with llm_disabled():
+        _, updates = expense_turn_to_field_updates("mirpur to office", memory)
+    assert updates
+    draft = memory.active_draft()
+    engine = FieldEngine()
+    engine.apply_updates(draft, updates)
+    sync_expense_draft(draft)
+    bus = draft.fields["items"][3]
+    assert bus.get("from_location") == "Mirpur"
+    assert bus.get("to_location") == "Office"
+    assert "route" not in (bus.get("missing_fields") or [])
+
+
+def _mirpur_to_office_pending_memory() -> SessionMemory:
+    memory = _expense_route_pending_memory()
+    memory.pending_question.prompt = (
+        "Expense 4 — Bus — 30.0 taka: where did you travel from and to?"
+    )
+    memory.pending_question.item_index = 3
+    memory.workflow_drafts["default"].fields["items"] = [
+        {
+            "category": "bus",
+            "amount": 30.0,
+            "status": "complete",
+            "from_location": "Kamlapur",
+            "to_location": "Dhanmondi",
+        },
+        {"category": "lunch", "amount": 120.0, "status": "complete"},
+        {
+            "category": "bike",
+            "amount": 130.0,
+            "status": "complete",
+            "from_location": "Dhanmondi",
+            "to_location": "Mirpur",
+        },
+        {"category": "bus", "amount": 30.0, "missing_fields": ["route"], "status": "incomplete"},
+    ]
+    return memory
+
+
+def test_mirpur_to_office_not_treated_as_draft_mutation():
+    """Route slot answers must not be blocked by modify/LLM heuristics."""
+    from chat.services.platform.field_extractors.expense import (
+        interpret_expense_draft_turn,
+        is_expense_draft_mutation_message,
+        is_expense_pending_field_value_answer,
+    )
+
+    memory = _mirpur_to_office_pending_memory()
+    msg = "mirpur to office"
+    assert not is_expense_draft_mutation_message(msg, memory)
+    assert is_expense_pending_field_value_answer(msg, memory)
+
+    turn = interpret_expense_draft_turn(msg, memory, trace_id="mirpur-office-rules")
+    assert turn.get("intent") == "answer_pending"
+    assert turn.get("llm_used") is False
+    patch = turn["item_patches"][0]
+    assert patch.get("from_location") == "Mirpur"
+    assert patch.get("to_location") == "Office"
+
+
 def test_bike_route_answer_not_marked_out_of_scope_when_scope_llm_misfires():
     """Regression: 'badda to gulshan' answering pending bike route must not OOS."""
     from unittest.mock import patch

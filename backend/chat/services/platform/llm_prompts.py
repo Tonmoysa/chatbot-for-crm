@@ -122,6 +122,9 @@ LEAVE TYPE (canonical enum ONLY: annual, sick, lwop)
 - Never map casual leave to annual.
 
 REVIEW / SUBMIT STAGE (pending_confirmation=submit or draft at confirm_submit)
+- pending_confirmation scopes ALL generic confirmations to the active workflow only.
+- ha/yes/submit/confirm/koro/ok/done during submit review → action=confirm on the ACTIVE workflow (leave or expense). Never switch workflow unless user explicitly names another (e.g. "expense submit koro", "leave cancel kore expense shuru koro").
+- If active_workflow is leave at confirm_submit, submit koro / ha / yes → workflow=leave, action=confirm — NEVER expense.
 - User editing draft → action=modify with ONLY the field(s) they want to change.
 - Complaints/questions about the draft ("but I don't see 3 days", "end date kothay") → clarification_needed, answers_pending_field=false, field_updates=[] — NEVER put complaint text in reason.
 - "reason ta tour" / "reason hobe family program" / "karon ta change kore X" → modify, reason=X (clean value).
@@ -201,37 +204,56 @@ FEW-SHOT
 11) "leave type lwop hobe" → intent=modify, [{"field":"leave_type","value":"lwop"}]
 """
 
-LEAVE_COLLECT_SLOT_SYSTEM = """You extract ONE leave wizard field the user was asked for.
+LEAVE_COLLECT_SLOT_SYSTEM = """You interpret the user's message during leave field collection.
 Return ONLY valid JSON:
 {
+  "answers_pending_field": true|false,
   "field": "leave_type|day_scope|half_day_period|start_date|end_date|reason|medical_document",
   "value": "...",
   "reasoning": "one short sentence — internal only"
 }
 
-RULES
-- Answer ONLY the pending_field from context. Do not invent other fields.
+STEP 1 — Decide answers_pending_field (critical)
+- true: user is answering the pending_field they were just asked.
+- false: user is correcting/updating a DIFFERENT field already in draft_fields, OR navigation/meta — NOT answering pending_field.
+
+Correction signals (answers_pending_field=false):
+- sorry, actually, wait, no, wrong, mistake, poriborton, change, correct
+- eta/eita/that/seita + new value for a prior field (e.g. pending day_scope but "sorry eta sick leave hobe")
+- explicit prior field name + new value (leave type, start date, end date, reason, full/half day)
+- user contradicts a value already in draft_fields
+
+When correcting: set field to the field being corrected (NOT pending_field), value to the new value, answers_pending_field=false.
+
+When NOT answering pending AND NOT correcting any draft field: {"answers_pending_field":false,"field":"","value":""}.
+
+STEP 2 — Field values
 - leave_type: annual, sick, or lwop only. Never casual/personal.
 - start_date/end_date: ISO YYYY-MM-DD — sole date interpreter.
   ajke=today_iso; kalke/kal/agamikal/tomorrow=today+1 day; porshu/poroshu/porshur=today+2 days; 14 july, next monday, ranges.
-  NEVER set start_date to a date already in submitted_leave_ranges from payload (user already has leave that day).
+  NEVER set start_date to a date already in submitted_leave_ranges from payload.
 - reason: short text; skip/none → empty value.
-- day_scope: full_day or half_day.
-- When start_date and end_date span 2+ days, set day_scope=full_day automatically (do not ask).
-- Only set half_day when user explicitly says half day / ordho din.
+- day_scope: full_day or half_day — ONLY when user explicitly states full day / half day / ordho din / puro din.
+  NEVER infer day_scope from leave_type mentions (sick leave, annual leave).
 - half_day_period: morning or afternoon.
 - medical_document: document text, or empty if user defers/skips.
-- If user is not answering the asked field, return {"field": "", "value": ""}.
 
-FEW-SHOT
-1) pending start_date, "kalke" → {"field":"start_date","value":"<tomorrow ISO>"}
-2) pending reason, "osusto" → {"field":"reason","value":"unwell"}
-3) pending leave_type, "sick" → {"field":"leave_type","value":"sick"}
-4) pending day_scope, "full day" → {"field":"day_scope","value":"full_day"}
-5) pending reason, "skip" → {"field":"reason","value":""}
-6) pending start_date, "agami 15 august" → {"field":"start_date","value":"2026-08-15"}
-7) pending end_date, "18 july porjonto" → {"field":"end_date","value":"2026-07-18"}
-8) pending start_date, "porshu tar" / "poroshu din" → {"field":"start_date","value":"<today_iso + 2 days>"}
+FEW-SHOT — answering pending
+1) pending start_date, "kalke" → {"answers_pending_field":true,"field":"start_date","value":"<tomorrow ISO>"}
+2) pending reason, "osusto" → {"answers_pending_field":true,"field":"reason","value":"unwell"}
+3) pending leave_type, "sick" → {"answers_pending_field":true,"field":"leave_type","value":"sick"}
+4) pending day_scope, "full day" → {"answers_pending_field":true,"field":"day_scope","value":"full_day"}
+5) pending day_scope, "ordho din" → {"answers_pending_field":true,"field":"day_scope","value":"half_day"}
+6) pending reason, "skip" → {"answers_pending_field":true,"field":"reason","value":""}
+
+FEW-SHOT — correcting prior field (pending stays unanswered)
+7) pending day_scope, draft leave_type=annual, "sorry eta sick leave hobe" → {"answers_pending_field":false,"field":"leave_type","value":"sick"}
+8) pending reason, draft leave_type=annual, "actually lwop hobe" → {"answers_pending_field":false,"field":"leave_type","value":"lwop"}
+9) pending day_scope, draft start_date set, "start date kalke hobe" → {"answers_pending_field":false,"field":"start_date","value":"<tomorrow ISO>"}
+10) pending end_date, draft start_date set, "end date 18 july" → {"answers_pending_field":false,"field":"end_date","value":"2026-07-18"}
+11) pending reason, draft day_scope=full_day, "ordho din hobe" → {"answers_pending_field":false,"field":"day_scope","value":"half_day"}
+12) pending leave_type, draft start_date set, "date ta 15 august koro" → {"answers_pending_field":false,"field":"start_date","value":"2026-08-15"}
+13) pending day_scope, "sick leave" alone with NO full/half day words → NOT day_scope; if correcting leave_type → field leave_type; else unclear → field "" value ""
 """
 
 LEAVE_FIELD_EXTRACT_SYSTEM = """Extract leave workflow fields from the user message.
@@ -317,11 +339,12 @@ Return ONLY valid JSON:
 INTENTS (user request takes priority)
 - show_list / show_summary / show_total: user wants to see expenses, summary, or total — return intent even if pending_question exists.
 - add: user adds new expense item(s) — action=append patches. **Wins over answer_pending** when message has explicit add phrasing (add koro, jog koro, ar ekta, notun expense) even if a category word appears.
+- **Review / confirm_submit stage:** when user explicitly adds new expense(s) (add koro, new expense, notun, ar ekta, hisabe add), NEVER update an existing line just because category matches — action=append for each new line; preserve existing items. Only update when user clearly refers to an existing line (first bus, item 2, change, edit, modify, replace, vule, er jaygay).
 - update / correct / modify_review: user fixes amount/category/route — action=update with item_index or match_amount; "it was 300" / "280 na 300" → update matching item, NEVER append duplicate.
 - **Correction phrasing (Banglish):** "jeta bus er 45 taka ota 35 hobe", "45 er jaygay 35 boshao", "oi expense ta vul ache", "ager bus amount ta change koro" → intent=update (or modify_review at review), action=update with match_amount=old amount and amount=new amount — NEVER action=append.
 - delete: user removes an item — action=delete or delete_indices. "1 no expense delete koro" → delete item_index 0. **Entry numbers in delete/modify messages are NEVER amounts** — "3 number bus delete koro" deletes Expense 3 (item_index 2), do NOT append bus 3 taka.
 - clarify_modify: user wants to change something but draft has **multiple matching items** (e.g. two bus lines) OR message is vague ("ami modify korte bolchi", "bus 130 taka" with 2 buses). Do NOT return empty conversation — set clarify.candidate_indices from draft_items.
-- clarify_delete: user wants delete but did not say which entry number.
+- clarify_delete: user wants delete but did not say which entry number OR names a category with **multiple matching items** (e.g. "bus delete koro" with 2 bus lines). Set clarify.candidate_indices from draft_items — NEVER guess item_index or delete_indices.
 - answer_pending: user answers ONLY the pending_question field (single category token, route pair, or amount) — NOT when adding a new line.
 - fix_mistake: user says bot duplicated/wrong item, or refers to data they already gave — delete mistaken append or apply value from conversation_history.
 - anti_summary: user says they do NOT want summary/list ("summery chai ni", "ami toh present expense chai ni") — no draft changes.
@@ -330,10 +353,11 @@ INTENTS (user request takes priority)
 
 RULES
 - **LLM owns natural language** — interpret Banglish freely; do not require exact keywords. Use draft_items labels (Expense 1 — Bus — 120 taka) to resolve references.
-- When user mentions a category (bus, lunch) and multiple draft_items share it, return clarify_modify with candidate_indices — NEVER guess which one.
+- When user mentions a category (bus, lunch) and multiple draft_items share it, return clarify_modify (for edits) or clarify_delete (for deletes) with candidate_indices — NEVER guess which one. Never return delete_indices unless exactly one item matches.
 - NEVER lose existing draft items. Merge patches into draft; do not recreate from scratch.
 - **Repeat / same message again:** user may resend the same expense lines — action=append each time (duplicate line items allowed). Show missing fields after; do NOT use show_list, update, or skip.
 - **Compound message (lunch + bus + bike in one message):** intent=add, one append patch per line — NEVER update item_index on existing rows.
+- **AMOUNT ASSOCIATION:** Each expense item must use the amount explicitly mentioned for that item. For each category, pick the numeric amount closest to that category word (before or after). Never copy a previous item's amount to the next item when another amount appears nearby. Example: "20 taka bus mirpur to baridhara lunch 100 taka bike 150 taka" → bus=20, lunch=100, bike=150 — NOT lunch=20.
 - Banglish route variants: "mirpur to motijheel/motekheel/motijhil", "X theke Y", "X theke Y porjonto".
 - Banglish summary: "summery", "summery daw", "expense er summery", "list dekhao", "expense e back koro", "expense continue".
 - One message may append multiple items AND update others AND delete — include all patches.
@@ -392,12 +416,13 @@ FEW-SHOT
 28) draft has Lunch 100, user: "lunch ta ami vule 100 taka diyechi ashole ota hobe 120 taka" → intent=modify_review, action=update, item_index for lunch, match_amount=100, amount=120 — NEVER 100
 29) user: "kalke lunch 100 bus 120" → intent=add, incurred_date=yesterday ISO, append lunch+bus (system blocks non-today)
 30) user: "lunch 100 taka" (no date) → intent=add, incurred_date=today_iso, append lunch
+31) user: "20 taka bus mirpur to baridhara lunch 100 taka bike 150 taka" → intent=add, append bus 20 + lunch 100 + bike 150 — lunch amount is 100 NOT 20
 """
 
 EXPENSE_DRAFT_INTERPRETER_SYSTEM_COMPACT = """Expense draft editor — return ONLY JSON:
 {"intent":"add|update|delete|modify_review|confirm|cancel|show_summary|show_list|show_total|answer_pending|clarify_modify|clarify_delete|conversation","incurred_date":"YYYY-MM-DD|null","item_patches":[{"action":"append|update|delete","item_index":0,"category":"lunch|snack|bus|train|bike|metro|rickshaw","amount":100,"from_location":"","to_location":""}],"delete_indices":[],"clarify":{},"reasoning":""}
 
-Rules: interpret Banglish freely; use items[] (i=index, cat, amt, route). **add** → action=append with amount from user message — NEVER set match_amount on append. **update/correct** only when user fixes one existing line (match_amount). Compound multi-item messages → intent=add, append only, no item_index. delete=delete_indices. review stage: modify_review for edits. clarify_modify when multiple matches. conversation ONLY for greeting/chitchat with no draft edit. Categories: lunch, snack, bus, train, bike, metro, rickshaw. incurred_date: user-stated date (today_iso if ajke/unspecified; yesterday ISO for kalke; tomorrow for agamikal). User repeats same items → append again (duplicates OK).
+Rules: interpret Banglish freely; use items[] (i=index, cat, amt, route). **add** → action=append with amount from user message — NEVER set match_amount on append. **AMOUNT ASSOCIATION:** each item uses the amount nearest its category — never inherit a prior item's amount. "20 taka bus ... lunch 100 taka bike 150 taka" → bus=20, lunch=100, bike=150. At review/confirm_submit: explicit add phrasing (add koro, new expense, notun, hisabe add) → append new lines only, never update existing rows unless user clearly edits an existing line. **update/correct** only when user fixes one existing line (match_amount). Compound multi-item messages → intent=add, append only, no item_index. delete: use delete_indices only when exactly one item matches; if category named and 2+ items match → clarify_delete with candidate_indices (NEVER guess index). review stage: modify_review for edits. clarify_modify/clarify_delete when multiple matches. conversation ONLY for greeting/chitchat with no draft edit. Categories: lunch, snack, bus, train, bike, metro, rickshaw. incurred_date: user-stated date (today_iso if ajke/unspecified; yesterday ISO for kalke; tomorrow for agamikal). User repeats same items → append again (duplicates OK).
 
 Few-shot:
 - "kalke lunch 100" → add, incurred_date=yesterday ISO, append lunch 100
@@ -406,6 +431,7 @@ Few-shot:
 - stage submitted, items [] → new expense; "lunch 100 taka" → add, append lunch 100 (ignore prior submitted amounts)
 - "lunch ta vule 100 diyechi ota 120 hobe" → modify_review, update lunch match_amount 100 amount 120
 - "bus 130 hobe" with 2 buses → clarify_modify, candidate_indices
+- "bus delete koro" with 2 buses → clarify_delete, candidate_indices [both bus indices], delete_indices=[]
 - "ha" at submit → confirm
 - "submit koro" / "subit koro" (typo) → intent=confirm, no patches
 - "list dekhao" → show_list
@@ -413,6 +439,31 @@ Few-shot:
 - "3,4,5 bad dao" → delete_indices [2,3,4]
 - blocked_add in payload + "last expense add koro" / "sheta add koro" → add, append each blocked item (today), submit_after if user asked
 - "vule kalke bolchi ajker khoroch" with blocked_add → add, append blocked items for today_iso (no new amounts in message)
+- "20 taka bus mirpur to baridhara lunch 100 taka bike 150 taka" → add, append bus 20, lunch 100, bike 150 (nearest amount per category)
+"""
+
+EXPENSE_COMPOUND_ITEMS_EXTRACT_SYSTEM = """Extract every expense line item from a run-on Banglish expense message.
+Return ONLY valid JSON:
+{
+  "items": [
+    {"category": "lunch|snack|bus|train|bike|metro|rickshaw", "amount": 100, "from_location": "", "to_location": ""}
+  ]
+}
+
+RULES
+- One object per expense item the user stated in the message.
+- Each item uses the amount nearest its category word — never copy a prior item's amount.
+- "20 taka bus mirpur to baridhara lunch 100 taka bike 150 taka mirpur to motejheel" → bus 20, lunch 100, bike 150.
+- Travel categories (bus, train, bike, metro, rickshaw) need from_location + to_location when user stated a route.
+- Banglish routes: "X to Y", "X theke Y", "mirpur to motijheel/motekheel".
+- Categories: lunch, snack, bus, train, bike, metro, rickshaw only.
+- Amount-only items without category → {"amount": N} without category.
+- Do not invent items, amounts, or routes.
+
+FEW-SHOT
+- "20 taka bus mirpur to baridhara lunch 100 taka bike 150 taka" → bus 20, lunch 100, bike 150
+- "Aj bus 120, lunch 280, ar 150 taka" → bus 120, lunch 280, {amount:150}
+- "kalke lunch 100 bus 120 mirpur to badda" → lunch 100, bus 120 with route
 """
 
 EXPENSE_SLOT_FROM_HISTORY_SYSTEM = """Extract ONE expense slot value from a prior user message.
@@ -567,6 +618,39 @@ FEW-SHOT (item_count=5):
 - "3 theke 5 delete koro" → [2,3,4]
 - "4,5 expense bad dao" → [3,4]
 - "prothom ta delete" → [0]
+"""
+
+EXPENSE_MODIFY_RESOLVER_SYSTEM = """Expense modify resolver — return ONLY JSON:
+{
+  "item_index": 0,
+  "amount": 150,
+  "category": "lunch",
+  "from_location": "",
+  "to_location": "",
+  "needs_clarify": false,
+  "candidate_indices": [],
+  "label": "lunch",
+  "match_amount": null,
+  "reasoning": ""
+}
+
+Resolve which draft line the user wants to edit and the new value. item_index is 0-based (expense 1 = index 0).
+
+RULES
+- Interpret Banglish freely: "vule 100 diyechi ota 150 hobe", "amount ta change koro", "1 number bus 130 taka".
+- Category references: lunch, snack, bus, train, bike, metro, rickshaw — match against items[].
+- Positional refs: "prothom/first" → first matching item; "sesh/last" → last matching item.
+- Numbered refs: "1 no", "expense 2", "3 number" → line number minus 1 as item_index.
+- Amount: use the NEW/correct amount — never confuse entry number with taka amount.
+- Route-only edits: fill from_location + to_location, amount null unless user also changes amount.
+- Multiple items match same category → needs_clarify=true, candidate_indices=[...], proposed amount in amount field.
+- Not a modify request → return {"needs_clarify": false, "item_index": null, "amount": null}.
+
+FEW-SHOT
+- items: [{cat:lunch,amt:100}], "lunch 150 taka hobe ami vule 100 diyechi" → item_index 0, amount 150, category lunch
+- items: 2 buses, "bus 130 taka hobe" → needs_clarify true, candidate_indices both bus indices, amount 130
+- items: [{cat:bus,amt:45}], "45 er jaygay 35 hobe" → item_index 0, amount 35, match_amount 45
+- "expense 2 130 taka" with 3 items → item_index 1, amount 130
 """
 
 HR_ASSISTANT_SCOPE_SYSTEM = """You decide whether a user message belongs in a workplace HR assistant (leave, expense, company policy, greetings, workflow control).

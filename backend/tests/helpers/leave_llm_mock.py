@@ -75,13 +75,16 @@ def _mock_review_response(message: str, payload: dict[str, Any]) -> dict[str, An
 def _mock_collect_response(message: str, payload: dict[str, Any]) -> dict[str, Any]:
     field = str(payload.get("pending_field") or "")
     low = (message or "").lower().strip()
+    draft = dict(payload.get("draft_fields") or {})
     if field == "start_date" and low in ("kalke", "kal", "tomorrow"):
-        return {"field": "start_date", "value": _tomorrow_iso()}
+        return {"answers_pending_field": True, "field": "start_date", "value": _tomorrow_iso()}
     if field == "leave_type" and low in ("sick", "annual", "lwop"):
-        return {"field": "leave_type", "value": low}
+        return {"answers_pending_field": True, "field": "leave_type", "value": low}
     if field == "reason" and low == "skip":
-        return {"field": "reason", "value": ""}
-    return {"field": field, "value": message}
+        return {"answers_pending_field": True, "field": "reason", "value": ""}
+    if field == "day_scope" and "sick" in low and draft.get("leave_type"):
+        return {"answers_pending_field": False, "field": "leave_type", "value": "sick"}
+    return {"answers_pending_field": True, "field": field, "value": message}
 
 
 def _mock_field_extract_response(message: str, payload: dict[str, Any]) -> dict[str, Any]:

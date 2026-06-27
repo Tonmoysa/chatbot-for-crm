@@ -770,7 +770,13 @@ def reduce_apply_field_updates(
 
         apply_leave_derived_fields(draft, message=message or "")
 
-    if updates:
+    after_fields = dict(draft.fields or {})
+    applied = [
+        u
+        for u in updates
+        if before_fields.get(u.field) != after_fields.get(u.field)
+    ]
+    if applied:
         from chat.services.observability import (
             classify_leave_field_apply_mode,
             log_field_updates_applied,
@@ -780,13 +786,13 @@ def reduce_apply_field_updates(
             trace_id,
             workflow_id=draft.workflow_id,
             draft_id=draft_id,
-            updates=serialize_field_updates(updates),
+            updates=serialize_field_updates(applied),
             before_fields=before_fields,
-            after_fields=dict(draft.fields or {}),
+            after_fields=after_fields,
             apply_mode=classify_leave_field_apply_mode(message, memory=memory),
             message=message or "",
         )
-    return serialize_field_updates(updates)
+    return serialize_field_updates(applied)
 
 
 def reduce_remove_draft_field(memory: SessionMemory, draft_id: str, field: str) -> None:

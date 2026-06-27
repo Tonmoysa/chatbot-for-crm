@@ -78,6 +78,52 @@ def test_rules_interpreter_appends_bus_without_llm():
     assert patch.get("amount") == 60.0
 
 
+def test_explicit_new_expense_add_beats_llm_modify_at_review():
+    """'new expense add koro bus …' must append even when bus already exists in draft."""
+    memory = SessionMemory(
+        active_workflow=ActiveWorkflow(id="expense", stage="confirm_submit"),
+        pending_confirmation="submit",
+        workflow_drafts={
+            "default": WorkflowDraft(
+                workflow_id="expense",
+                fields={
+                    "incurred_date": "2026-06-27",
+                    "items": [
+                        {
+                            "category": "bus",
+                            "amount": 25.0,
+                            "from_location": "gulshan",
+                            "to_location": "baridhara",
+                        },
+                        {"category": "lunch", "amount": 120.0},
+                    ],
+                },
+            )
+        },
+    )
+    llm_turn = {
+        "intent": "modify_review",
+        "item_patches": [
+            {
+                "action": "update",
+                "item_index": 0,
+                "category": "bus",
+                "amount": 30,
+                "from_location": "mirpur",
+                "to_location": "badda",
+            }
+        ],
+    }
+    msg = "okay..ekta new expense add koro bus 30 taka mirpur to badda"
+    final = finalize_expense_turn_patches(llm_turn, msg, memory)
+    assert final.get("intent") == "add"
+    patch = final["item_patches"][0]
+    assert patch.get("action") == "append"
+    assert patch.get("category") == "bus"
+    assert patch.get("amount") == 30.0
+    assert "item_index" not in patch
+
+
 def test_bare_yes_on_pending_route_no_crash():
     memory = _bike_route_pending_memory()
     understanding = UnderstandingResult(

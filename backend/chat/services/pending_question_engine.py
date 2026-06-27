@@ -105,6 +105,7 @@ def intent_priority_decision(
     """Structured understanding beats open pending_question (SSOT priority)."""
     from chat.services.platform.field_extractors.expense import (
         expense_turn_has_targeted_patches,
+        memory_has_expense_draft,
         message_has_new_expense_items,
         message_requests_submit_after_edit,
         pending_expense_edit_active,
@@ -191,6 +192,27 @@ def intent_priority_decision(
             extracted_entities={"interrupts_pending": bool(pq)},
         )
 
+    def _new_expense_with_updates(*, reasoning: str) -> PendingQuestionDecision:
+        return PendingQuestionDecision(
+            kind=MessageIntentKind.NEW_WORKFLOW,
+            confidence=max(conf, 0.88),
+            reasoning=reasoning,
+            source=src,
+            blocks_new_workflow=False,
+            target_workflow="expense",
+            extracted_entities={"interrupts_pending": bool(pq)},
+        )
+
+    def _route_expense_mutation(*, reasoning: str, target: str | None = None):
+        wf_target = (target or wf or "expense").strip().lower()
+        if wf_target == "expense" and has_patches and not memory_has_expense_draft(memory):
+            return _new_expense_with_updates(reasoning=reasoning or "New expense claim with line items.")
+        return _decision(
+            MessageIntentKind.MODIFY_DATA,
+            reasoning=reasoning,
+            target=target,
+        )
+
     from chat.services.platform.intent_rules import is_bare_confirmation
 
     if (
@@ -265,8 +287,7 @@ def intent_priority_decision(
             and pq.workflow_id == "expense"
             and is_bare_confirmation(message)
         ):
-            return _decision(
-                MessageIntentKind.MODIFY_DATA,
+            return _route_expense_mutation(
                 reasoning=understanding.reasoning or "Modify expense line.",
             )
 
@@ -278,8 +299,7 @@ def intent_priority_decision(
 
     if expense_intent == "add" and understanding.field_updates:
         if message_has_new_expense_items(message) and item_field_updates:
-            return _decision(
-                MessageIntentKind.MODIFY_DATA,
+            return _route_expense_mutation(
                 reasoning=understanding.reasoning or "Compound expense overrides pending slot.",
             )
         if not pq and (not aw or aw.id != "expense"):
@@ -298,10 +318,17 @@ def intent_priority_decision(
                 reasoning=understanding.reasoning or "Add expense line.",
                 target=aw.id if aw else "expense",
             )
-        return _decision(
-            MessageIntentKind.MODIFY_DATA,
+        return _route_expense_mutation(
             reasoning=understanding.reasoning or "Add expense line.",
             target=aw.id if aw else "expense",
+        )
+
+    if understanding.action in (
+        UnderstandingAction.START.value,
+        UnderstandingAction.COLLECT.value,
+    ) and has_patches and str(wf or "").lower() == "expense" and not memory_has_expense_draft(memory):
+        return _new_expense_with_updates(
+            reasoning=understanding.reasoning or "Start expense with line items.",
         )
 
     if understanding.action == UnderstandingAction.REVIEW.value or expense_intent in (
@@ -326,8 +353,7 @@ def intent_priority_decision(
     )
     if wants_submit:
         if message_has_new_expense_items(message) and has_patches:
-            return _decision(
-                MessageIntentKind.MODIFY_DATA,
+            return _route_expense_mutation(
                 reasoning=understanding.reasoning or "Apply expense items before submit.",
             )
         return _decision(
@@ -579,6 +605,32 @@ def informational_priority_decision(
             blocks_new_workflow=False,
         )
 
+    aw = memory.active_workflow
+    from chat.services.platform.field_extractors.expense import is_expense_review_edit_turn
+
+    if aw and aw.id == "expense" and is_expense_review_edit_turn(raw, memory, understanding):
+        return None
+
+    if include_policy_status:
+        if is_status_query(raw):
+            return PendingQuestionDecision(
+                kind=MessageIntentKind.ASK_STATUS,
+                confidence=0.9,
+                reasoning="Request reference or status lookup phrasing.",
+                source="rules",
+                blocks_new_workflow=blocks,
+            )
+        if not is_workflow_application_message(raw) and (
+            is_policy_kb_query(raw) or is_rules_query(raw)
+        ):
+            return PendingQuestionDecision(
+                kind=MessageIntentKind.ASK_POLICY,
+                confidence=0.9,
+                reasoning="Policy or rules query detected.",
+                source="rules",
+                blocks_new_workflow=blocks,
+            )
+
     from chat.services.platform.hr_assistant_scope import resolve_hr_assistant_scope
 
     scope_oos = resolve_hr_assistant_scope(
@@ -683,26 +735,6 @@ def informational_priority_decision(
             source="rules",
             blocks_new_workflow=True,
             target_workflow=aw.id,
-        )
-
-    if is_status_query(raw):
-        return PendingQuestionDecision(
-            kind=MessageIntentKind.ASK_STATUS,
-            confidence=0.9,
-            reasoning="Request reference or status lookup phrasing.",
-            source="rules",
-            blocks_new_workflow=blocks,
-        )
-
-    if not is_workflow_application_message(raw) and (
-        is_policy_kb_query(raw) or is_rules_query(raw)
-    ):
-        return PendingQuestionDecision(
-            kind=MessageIntentKind.ASK_POLICY,
-            confidence=0.9,
-            reasoning="Policy or rules query detected.",
-            source="rules",
-            blocks_new_workflow=blocks,
         )
 
     return None
@@ -1658,6 +1690,22 @@ class PendingQuestionEngine:
             from chat.services.platform.field_extractors.expense import (
                 expense_turn_has_targeted_patches,
             )
+
+            leave_intent = str((understanding.entities or {}).get("leave_intent") or "").lower()
+            if (
+                leave_intent == "correct_field"
+                and understanding.field_updates
+                and aw
+                and aw.id == "leave"
+            ):
+                return PendingQuestionDecision(
+                    kind=MessageIntentKind.MODIFY_DATA,
+                    confidence=max(conf, 0.88),
+                    reasoning=understanding.reasoning or "Correct prior leave field during collect.",
+                    source=src,
+                    blocks_new_workflow=True,
+                    target_workflow="leave",
+                )
 
             expense_turn = (understanding.entities or {}).get("expense_turn")
             if expense_turn_has_targeted_patches(expense_turn, memory):

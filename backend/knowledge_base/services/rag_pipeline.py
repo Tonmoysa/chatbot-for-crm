@@ -149,6 +149,16 @@ def try_hr_policy_rag(
 
     client = llm or LLMClient()
     if not client.is_configured():
+        from chat.services.rag_excerpt_fallback import excerpt_result_from_hits
+
+        excerpt = excerpt_result_from_hits(
+            hits,
+            trace_id,
+            company_id=company_id,
+            retrieval_query=retrieval_query,
+        )
+        if excerpt:
+            return excerpt
         return None
 
     reply_lang = detect_reply_language(msg)
@@ -172,6 +182,16 @@ def try_hr_policy_rag(
     )
 
     if not isinstance(parsed, dict):
+        from chat.services.rag_excerpt_fallback import excerpt_result_from_hits
+
+        excerpt = excerpt_result_from_hits(
+            hits,
+            trace_id,
+            company_id=company_id,
+            retrieval_query=retrieval_query,
+        )
+        if excerpt:
+            return excerpt
         return None
 
     insufficient = bool(parsed.get("insufficient_evidence"))
@@ -189,6 +209,16 @@ def try_hr_policy_rag(
                 "had_answer": bool(answer),
             },
         )
+        from chat.services.rag_excerpt_fallback import excerpt_result_from_hits
+
+        excerpt = excerpt_result_from_hits(
+            hits,
+            trace_id,
+            company_id=company_id,
+            retrieval_query=retrieval_query,
+        )
+        if excerpt:
+            return excerpt
         return None
 
     answer = polish_policy_answer(answer)

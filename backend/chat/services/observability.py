@@ -84,6 +84,7 @@ def log_expense_draft_turn(
         "answer_pending",
         "add",
         "update",
+        "modify_review",
         "delete",
         "correct",
     )

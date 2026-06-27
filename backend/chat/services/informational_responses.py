@@ -184,12 +184,22 @@ def compose_policy_turn(
     answer_text = (rag or {}).get("text") or (rag or {}).get("answer")
     if rag and answer_text:
         reply_lang = resolve_reply_language(message)
-        answer = align_policy_answer_language(
-            str(answer_text),
-            user_message=message,
-            target_lang=reply_lang,
-            trace_id=trace_id,
-        )
+        if (rag.get("mode") or "") == "rag_excerpt":
+            # Excerpt fallback is already grounded in retrieved chunks — skip a
+            # second LLM pass that can hallucinate or fail under rate limits.
+            answer = str(answer_text).rstrip()
+            if reply_lang in ("bn", "banglish"):
+                answer = answer.replace(
+                    "Here is what I found in your uploaded HR policies:",
+                    "Apnar uploaded HR policy theke je ta pelam:",
+                )
+        else:
+            answer = align_policy_answer_language(
+                str(answer_text),
+                user_message=message,
+                target_lang=reply_lang,
+                trace_id=trace_id,
+            )
         crm_payload["rules_answer"] = answer.rstrip() + "\n\n" + policy_rules_footer(lang=reply_lang)
         decision = {
             **decision,

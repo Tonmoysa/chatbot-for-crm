@@ -22,6 +22,7 @@ from tests.helpers.pipeline_handle import handle_with_rules_understanding
 def test_is_valid_expense_route_rejects_hallucinated_office_jawar():
     assert not is_valid_expense_route("office", "jawar")
     assert is_valid_expense_route("Mirpur", "Agargaon")
+    assert is_valid_expense_route("Mirpur", "Office")
 
 
 def test_extract_amount_only_item_category_mone_nei():
@@ -44,6 +45,15 @@ def test_is_expense_list_request_matches_transcript_phrases():
     assert is_expense_list_request("aj saradin ki ki expense korchi tar list ta dekhao toh")
     assert is_expense_list_request("ami expense er list jante ceyechi")
     assert not is_expense_list_request("leave er summery ta dekhao")
+
+
+def test_ajke_expense_hoyeche_is_not_list_request():
+    """Narrative claims must not be misread as today's expense list queries."""
+    assert not is_expense_list_request("amar ajke expense hoyeche 100 taka bus e")
+    assert not is_expense_list_request(
+        "amar ajke expense hoyeche 100 taka bus e ..train e 30 taka mirpur to uttora "
+        "then tarpor lunch 120 taka...tumi amar hoye eta ektu submit kore daw"
+    )
 
 
 def test_compound_expense_includes_150_and_no_bus_route_hallucination():

@@ -552,21 +552,31 @@ class FieldEngine:
         ):
             from chat.services.platform.field_extractors.leave import (
                 _pending_collect_allowed_fields,
-                collect_slot_field_updates,
+                leave_collect_turn_to_field_updates,
+                resolve_leave_collect_turn,
             )
 
             allowed = _pending_collect_allowed_fields(pq.field)
             merged = {k: v for k, v in merged.items() if k in allowed}
             if not merged:
-                slot = collect_slot_field_updates(
+                turn = resolve_leave_collect_turn(
                     message,
                     memory,
                     trace_id=trace_id,
                     understanding_updates=result.field_updates,
                 )
+                slot = leave_collect_turn_to_field_updates(turn)
                 result.field_updates = slot
                 if slot:
-                    result.action = UnderstandingAction.COLLECT.value
+                    if turn.get("is_correction"):
+                        result.action = UnderstandingAction.MODIFY.value
+                        result.answers_pending_field = False
+                        entities = dict(result.entities or {})
+                        entities["leave_intent"] = "correct_field"
+                        result.entities = entities
+                    else:
+                        result.action = UnderstandingAction.COLLECT.value
+                        result.answers_pending_field = turn.get("answers_pending_field", True)
                 return result
 
         result.field_updates = self._dict_to_field_updates(merged)

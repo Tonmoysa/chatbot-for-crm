@@ -478,8 +478,52 @@ class ResponseComposer:
             return f"{lead}\n\n" + "\n".join(numbered)
 
         if indices:
-            lines = [f"{idx + 1}. {expense_item_label(items[idx], index=idx)}" for idx in indices]
-            if proposed_amt is not None and cat:
+            lines = [f"{pos + 1}. {expense_item_label(items[idx], index=idx)}" for pos, idx in enumerate(indices)]
+            target_field = str(clarify.get("target_field") or "").strip().lower()
+            match_amount = clarify.get("match_amount")
+            try:
+                match_amt = float(match_amount) if match_amount is not None else None
+            except (TypeError, ValueError):
+                match_amt = None
+            operation = str(clarify.get("operation") or "").strip().lower()
+            if intent == "clarify_delete" or operation == "delete":
+                if cat:
+                    lead = localized(
+                        lang,
+                        en=f"You have **{len(indices)} {cat}** expenses. Which one should I delete?",
+                        bn=f"**{len(indices)} টা {cat}** expense আছে। কোনটা delete করব?",
+                        banglish=f"**{len(indices)} ta {cat}** expense ache. Konta delete korbo?",
+                    )
+                else:
+                    lead = localized(
+                        lang,
+                        en=f"**Which expense should I delete?** ({len(indices)} matches)",
+                        bn=f"**কোন expense delete করব?** ({len(indices)} টা মিলেছে)",
+                        banglish=f"**Kon expense delete korbo?** ({len(indices)} ta mileche)",
+                    )
+            elif target_field == "route":
+                if cat:
+                    lead = localized(
+                        lang,
+                        en=f"You have **{len(indices)} {cat}** expenses. Which route should I update?",
+                        bn=f"আপনার draft-এ **{len(indices)} টা {cat}** expense আছে। কোনটা update করতে চান?",
+                        banglish=f"Apnar draft-e **{len(indices)} ta {cat}** expense ache. Konta update korte chan?",
+                    )
+                else:
+                    lead = localized(
+                        lang,
+                        en="**Which expense route should I update?** Reply with the entry number.",
+                        bn="**কোন expense-এর route** update করব? entry নম্বর লিখুন।",
+                        banglish="**Kon expense er route** update korbo? entry number likhun.",
+                    )
+            elif match_amt is not None and not cat:
+                lead = localized(
+                    lang,
+                    en=f"You have **{len(indices)} expenses** at **{match_amt:.0f} taka**. Which one should I update?",
+                    bn=f"**{match_amt:.0f} taka**-র **{len(indices)} টা** expense আছে। কোনটা update করতে চান?",
+                    banglish=f"**{match_amt:.0f} taka** er **{len(indices)} ta** expense ache. Konta update korte chan?",
+                )
+            elif proposed_amt is not None and cat:
                 lead = localized(
                     lang,
                     en=f"You have **{len(indices)} {cat}** expenses. Which one should be **{proposed_amt:.0f} taka**?",

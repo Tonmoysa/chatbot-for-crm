@@ -163,21 +163,28 @@ class AIUnderstandingLayer:
             return guarded
 
         if client.is_configured():
+            from chat.services.platform.field_extractors.expense import is_expense_review_edit_turn
             from chat.services.platform.hr_assistant_scope import resolve_hr_assistant_scope
 
-            scope_oos = resolve_hr_assistant_scope(
-                raw,
-                memory,
-                conversation_history=conversation_history,
-                trace_id=trace_id,
+            skip_hr_scope = bool(
+                memory.active_workflow
+                and memory.active_workflow.id == "expense"
+                and is_expense_review_edit_turn(raw, memory)
             )
-            if scope_oos is not None:
-                from chat.services.platform.turn_semantics import enrich_answers_pending_field
+            if not skip_hr_scope:
+                scope_oos = resolve_hr_assistant_scope(
+                    raw,
+                    memory,
+                    conversation_history=conversation_history,
+                    trace_id=trace_id,
+                )
+                if scope_oos is not None:
+                    from chat.services.platform.turn_semantics import enrich_answers_pending_field
 
-                result = enrich_answers_pending_field(message, memory, scope_oos)
-                guarded = apply_confidence_guard(result)
-                self._log(trace_id, raw, memory, guarded)
-                return guarded
+                    result = enrich_answers_pending_field(message, memory, scope_oos)
+                    guarded = apply_confidence_guard(result)
+                    self._log(trace_id, raw, memory, guarded)
+                    return guarded
 
         if client.is_configured():
             domain = self._try_domain_workflow_understanding(
@@ -611,6 +618,25 @@ class AIUnderstandingLayer:
         result.entities = entities
         return result
 
+    @staticmethod
+    def _is_informational_interrupt_message(message: str) -> bool:
+        """Policy/status/today — must not run expense/leave domain LLM."""
+        from chat.services.platform.intent_rules import is_status_query, is_workflow_application_message
+        from chat.services.policy_intent_helpers import (
+            is_hr_today_date_query,
+            is_policy_kb_query,
+            is_rules_query,
+        )
+
+        if is_workflow_application_message(message):
+            return False
+        return (
+            is_policy_kb_query(message)
+            or is_rules_query(message)
+            or is_status_query(message)
+            or is_hr_today_date_query(message)
+        )
+
     def _try_domain_workflow_understanding(
         self,
         message: str,
@@ -620,6 +646,8 @@ class AIUnderstandingLayer:
         trace_id: str,
     ) -> UnderstandingResult | None:
         """One domain LLM per turn when a workflow is already active (leave-like path)."""
+        if self._is_informational_interrupt_message(message):
+            return None
         cross_expense = self._try_cross_workflow_new_expense_route(
             message,
             memory,
@@ -796,6 +824,8 @@ class AIUnderstandingLayer:
         from chat.services.platform.field_extractors.leave import (
             collect_slot_field_updates,
             is_leave_review_mode,
+            leave_collect_turn_to_field_updates,
+            resolve_leave_collect_turn,
             review_field_updates_from_message,
         )
         from chat.services.platform.intent_rules import (
@@ -873,18 +903,23 @@ class AIUnderstandingLayer:
 
         pq = memory.pending_question
         if pq and pq.workflow_id == "leave" and pq.field:
-            updates = collect_slot_field_updates(
-                message, memory, trace_id=trace_id
-            )
+            turn = resolve_leave_collect_turn(message, memory, trace_id=trace_id)
+            updates = leave_collect_turn_to_field_updates(turn)
             if updates:
+                is_correction = bool(turn.get("is_correction"))
                 return UnderstandingResult(
-                    goal="Answer leave slot",
+                    goal="Correct leave field" if is_correction else "Answer leave slot",
                     workflow="leave",
-                    action=UnderstandingAction.COLLECT.value,
+                    action=UnderstandingAction.MODIFY.value
+                    if is_correction
+                    else UnderstandingAction.COLLECT.value,
                     confidence=0.88,
                     field_updates=updates,
-                    answers_pending_field=True,
-                    reasoning="Leave collect-slot domain LLM.",
+                    answers_pending_field=turn.get("answers_pending_field"),
+                    entities={"leave_intent": "correct_field"} if is_correction else None,
+                    reasoning="Leave collect-slot correction."
+                    if is_correction
+                    else "Leave collect-slot domain LLM.",
                     source="llm_leave",
                 )
 
@@ -1073,8 +1108,11 @@ class AIUnderstandingLayer:
                 )
 
                 if is_leave_review_mode(memory) or memory.pending_confirmation == "submit":
+                    active_wf = (
+                        memory.active_workflow.id if memory.active_workflow else "leave"
+                    )
                     if is_bare_confirmation(message) or parse_submit_workflow(
-                        message, active_workflow_id="leave"
+                        message, active_workflow_id=active_wf
                     ):
                         result = UnderstandingResult(
                             goal="Confirm submit",
@@ -2179,19 +2217,29 @@ class AIUnderstandingLayer:
                     )
                 if parsed is None:
                     from chat.services.platform.field_extractors.leave import (
-                        collect_slot_field_updates,
+                        leave_collect_turn_to_field_updates,
+                        resolve_leave_collect_turn,
                     )
 
-                    slot_updates = collect_slot_field_updates(message, memory)
+                    turn = resolve_leave_collect_turn(message, memory)
+                    slot_updates = leave_collect_turn_to_field_updates(turn)
                     if slot_updates:
+                        is_correction = bool(turn.get("is_correction"))
                         return UnderstandingResult(
-                            goal=f"Answer {pq.field}",
+                            goal=f"Correct {slot_updates[0].field}"
+                            if is_correction
+                            else f"Answer {pq.field}",
                             workflow="leave",
-                            action=UnderstandingAction.COLLECT.value,
+                            action=UnderstandingAction.MODIFY.value
+                            if is_correction
+                            else UnderstandingAction.COLLECT.value,
                             confidence=0.84,
-                            answers_pending_field=True,
+                            answers_pending_field=turn.get("answers_pending_field"),
                             field_updates=slot_updates,
-                            reasoning=f"Semantic collect for pending field '{pq.field}'.",
+                            entities={"leave_intent": "correct_field"} if is_correction else None,
+                            reasoning="Leave field correction during collect."
+                            if is_correction
+                            else f"Semantic collect for pending field '{pq.field}'.",
                             source="rules",
                         )
                     return UnderstandingResult(
@@ -2392,13 +2440,44 @@ class AIUnderstandingLayer:
         )
         active_wf = active_id or "expense"
         if expense_message_requests_submit(message, active_workflow_id=active_wf):
-            turn = {
-                **turn,
-                "intent": "confirm",
-                "item_patches": [],
-                "delete_indices": [],
-            }
-            updates = []
+            from chat.services.platform.field_extractors.expense import (
+                build_wizard_fallback_turn,
+                message_has_new_expense_items,
+            )
+            from chat.services.platform.intent_rules import is_compound_expense_message, is_expense_message
+
+            has_expense_body = (
+                message_has_new_expense_items(message)
+                or is_compound_expense_message(message)
+                or is_expense_message(message)
+            )
+            if has_expense_body and _turn_has_actionable_patches(turn):
+                turn = {**turn, "submit_after_edit": True}
+            elif has_expense_body and not _turn_has_actionable_patches(turn):
+                wizard = build_wizard_fallback_turn(message, memory, trace_id=trace_id)
+                if _turn_has_actionable_patches(wizard):
+                    turn = {**wizard, "submit_after_edit": True}
+                    draft = memory.active_draft()
+                    fields = (
+                        dict(draft.fields or {})
+                        if draft and draft.workflow_id == "expense"
+                        else {"items": []}
+                    )
+                    pq = memory.pending_question
+                    pending_idx = pq.item_index if pq and pq.workflow_id == "expense" else None
+                    updates = patches_to_field_updates(
+                        fields,
+                        turn,
+                        pending_item_index=pending_idx,
+                    )
+            elif not has_expense_body:
+                turn = {
+                    **turn,
+                    "intent": "confirm",
+                    "item_patches": [],
+                    "delete_indices": [],
+                }
+                updates = []
         intent = str(turn.get("intent") or "").lower()
         if intent == "date_not_allowed" or turn.get("date_policy_rejected"):
             updates = []

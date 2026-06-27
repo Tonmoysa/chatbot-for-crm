@@ -148,6 +148,7 @@ def is_expense_add_request(message: str) -> bool:
             "jog koro",
             "jog kore",
             "notun expense",
+            "new expense",
             "ar ekta",
             "aro ekta",
             "add korte",
@@ -473,6 +474,11 @@ _EXPENSE_LIST_RE = re.compile(
     re.I | re.UNICODE,
 )
 
+_EXPENSE_NARRATIVE_CLAIM_RE = re.compile(
+    r"\b(?:hoyeche|hoise|hoyese|lagse|laglo|hoyechilo|korechi|korchi|korlam|korle)\b",
+    re.I | re.UNICODE,
+)
+
 
 def is_expense_list_request(message: str) -> bool:
     """User wants today's / pending expense item list — not leave summary."""
@@ -485,6 +491,11 @@ def is_expense_list_request(message: str) -> bool:
     if re.search(r"\bleave\b", low) and not re.search(r"\bexpense", low):
         return False
     if _EXPENSE_LIST_RE.search(raw):
+        # "amar ajke expense hoyeche 100 taka" is a claim, not a list/summary query.
+        if is_compound_expense_message(raw):
+            return False
+        if parse_amount(raw) and _EXPENSE_NARRATIVE_CLAIM_RE.search(low):
+            return False
         return True
     if re.search(r"\b(?:list|ki\s+ki|jante\s+ceyechi|jante\s+chai)\b", low) and re.search(
         r"\b(?:expense|khoroch|kharcha)\b", low
@@ -620,14 +631,47 @@ def should_resume_suspended_expense(
     message: str,
     active_workflow_id: str | None,
     suspended_workflows: list | tuple | None,
+    memory=None,
 ) -> bool:
-    """Another workflow is active but user navigates to a suspended expense draft."""
-    if "expense" not in suspended_workflow_ids(suspended_workflows):
-        return False
+    """Navigate back to expense draft — suspended, stored, or orphaned in session."""
+    from chat.services.platform.field_extractors.expense import memory_has_expense_draft
+
     active = (active_workflow_id or "").strip().lower()
     if active == "expense":
         return False
-    return is_expense_draft_query(message)
+    if not is_expense_draft_query(message) and not is_pure_expense_navigation(message):
+        return False
+    if "expense" in suspended_workflow_ids(suspended_workflows):
+        return True
+    return bool(memory is not None and memory_has_expense_draft(memory))
+
+
+def should_resume_suspended_leave(
+    *,
+    message: str,
+    active_workflow_id: str | None,
+    suspended_workflows: list | tuple | None,
+    memory=None,
+) -> bool:
+    """Navigate back to leave draft — suspended, stored, or orphaned in session."""
+    from chat.services.platform.field_engine import leave_draft_in_progress
+    from chat.services.platform.workflow_show import session_leave_draft
+
+    active = (active_workflow_id or "").strip().lower()
+    if active == "leave":
+        return False
+    if not is_resume_workflow_request(message, workflow_id="leave"):
+        return False
+    if "leave" in suspended_workflow_ids(suspended_workflows):
+        return True
+    if memory is None:
+        return False
+    draft = session_leave_draft(memory)
+    return bool(
+        draft
+        and leave_draft_in_progress(draft)
+        and not getattr(draft, "locked", False)
+    )
 
 
 def find_submitted_leave_overlap_from_message(

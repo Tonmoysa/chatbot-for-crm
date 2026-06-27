@@ -196,19 +196,28 @@ def enrich_answers_pending_field(
     active_id = aw.id if aw else ""
 
     if memory.pending_confirmation == "submit":
-        from chat.services.platform.field_extractors.expense import expense_message_requests_submit
+        from chat.services.platform.intent_rules import is_bare_confirmation, parse_submit_workflow
         from chat.services.platform.workflow_show import resolve_workflow_show_target
 
         result.answers_pending_field = False
-        active_wf = (active_id or result.workflow or "expense").strip().lower()
-        if expense_message_requests_submit(message, active_workflow_id=active_wf):
+        active_wf = (active_id or result.workflow or "leave").strip().lower()
+        submit_target = parse_submit_workflow(message, active_workflow_id=active_wf)
+        if submit_target == active_wf or (
+            is_bare_confirmation(message) and active_wf in ("leave", "expense")
+        ):
             result.field_updates = []
             result.action = UnderstandingAction.CONFIRM.value
-            result.workflow = "expense"
-            result.entities = {
-                **(result.entities or {}),
-                "expense_intent": "confirm",
+            result.workflow = active_wf
+            entities = {
+                k: v
+                for k, v in (result.entities or {}).items()
+                if k not in ("expense_intent", "leave_intent")
             }
+            if active_wf == "leave":
+                entities["leave_intent"] = "submit"
+            elif active_wf == "expense":
+                entities["expense_intent"] = "confirm"
+            result.entities = entities
             return result
         show_wf = resolve_workflow_show_target(
             message,
@@ -328,6 +337,26 @@ def enrich_answers_pending_field(
         if resolve_pending_expense_edit_turn(message, memory):
             result.answers_pending_field = False
             return result
+
+    if wf_id == "leave":
+        leave_intent = str((result.entities or {}).get("leave_intent") or "").lower()
+        if leave_intent == "correct_field" and result.field_updates:
+            result.answers_pending_field = False
+            if result.action == UnderstandingAction.COLLECT.value:
+                result.action = UnderstandingAction.MODIFY.value
+            return result
+        pq_field = (pq.field or "").strip()
+        if result.field_updates and pq_field:
+            non_pending = [
+                u for u in result.field_updates if str(u.field) != pq_field
+            ]
+            if non_pending and result.answers_pending_field is not False:
+                result.answers_pending_field = False
+                result.action = UnderstandingAction.MODIFY.value
+                entities = dict(result.entities or {})
+                entities["leave_intent"] = "correct_field"
+                result.entities = entities
+                return result
 
     if wf_id == "expense":
         from chat.services.platform.field_extractors.expense import is_expense_anti_summary_request

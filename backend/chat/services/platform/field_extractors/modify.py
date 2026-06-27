@@ -52,10 +52,237 @@ _FIRST_REF_RE = re.compile(
 )
 
 
+def build_which_item_clarify(
+    *,
+    operation: str = "update",
+    candidate_indices: list[int],
+    target_field: str = "amount",
+    pending_patch: dict[str, Any] | None = None,
+    proposed_value: Any = None,
+    category: str | None = None,
+    match_amount: Any = None,
+) -> dict[str, Any]:
+    clarify: dict[str, Any] = {
+        "kind": "which_item",
+        "candidate_indices": list(candidate_indices),
+        "target_field": target_field,
+        "operation": operation,
+    }
+    if category:
+        clarify["category"] = category
+    if proposed_value is not None:
+        clarify["proposed_value"] = proposed_value
+    if match_amount is not None:
+        clarify["match_amount"] = match_amount
+    if pending_patch:
+        clarify["pending_patch"] = dict(pending_patch)
+    return clarify
+
+
+def _parse_modify_request_llm(
+    message: str,
+    items: list[dict],
+    *,
+    trace_id: str = "",
+) -> dict[str, Any] | None:
+    """LLM resolver for modify phrasing — primary path when LLM is configured."""
+    raw = (message or "").strip()
+    if not raw or not items:
+        return None
+    try:
+        import json
+
+        from chat.services.llm_client import LLMClient
+        from chat.services.platform.llm_prompts import EXPENSE_MODIFY_RESOLVER_SYSTEM
+
+        payload = {
+            "message": raw,
+            "item_count": len(items),
+            "items": [
+                {
+                    "index": i,
+                    "line": i + 1,
+                    "category": it.get("category"),
+                    "amount": it.get("amount"),
+                    "from_location": it.get("from_location"),
+                    "to_location": it.get("to_location"),
+                }
+                for i, it in enumerate(items)
+            ],
+        }
+        parsed = LLMClient().chat_json(
+            system_prompt=EXPENSE_MODIFY_RESOLVER_SYSTEM,
+            user_prompt=json.dumps(payload, ensure_ascii=False, default=str),
+            trace_id=trace_id or "",
+            scope="expense-modify",
+        )
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    if parsed.get("needs_clarify"):
+        candidate_indices: list[int] = []
+        for raw_idx in parsed.get("candidate_indices") or []:
+            try:
+                idx = int(raw_idx)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < len(items):
+                candidate_indices.append(idx)
+        amount = parsed.get("amount")
+        return {
+            "needs_clarify": True,
+            "candidate_indices": sorted(set(candidate_indices)),
+            "amount": float(amount) if amount is not None else None,
+            "category": parsed.get("category"),
+            "label": str(parsed.get("label") or parsed.get("category") or "item"),
+            "match_amount": parsed.get("match_amount"),
+        }
+
+    item_index = parsed.get("item_index")
+    if item_index is None:
+        return None
+    try:
+        idx = int(item_index)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= idx < len(items)):
+        return None
+
+    result: dict[str, Any] = {
+        "item_index": idx,
+        "label": str(parsed.get("label") or f"expense {idx + 1}"),
+        "needs_confirm": False,
+    }
+    if parsed.get("amount") is not None:
+        result["amount"] = float(parsed["amount"])
+    if parsed.get("category"):
+        result["category"] = parsed["category"]
+    if parsed.get("match_amount") is not None:
+        result["match_amount"] = parsed["match_amount"]
+    frm = str(parsed.get("from_location") or "").strip()
+    to = str(parsed.get("to_location") or "").strip()
+    if frm and to:
+        result["from_location"] = frm
+        result["to_location"] = to
+    if result.get("amount") is None and not (frm and to):
+        return None
+    return result
+
+
 def _category_from_message(low: str) -> str | None:
-    for token in ("bus", "lunch", "snack", "metro", "bike", "rickshaw", "train"):
+    from chat.services.platform.field_extractors.expense import (
+        infer_category_from_clause,
+        normalize_expense_category,
+    )
+
+    cat = infer_category_from_clause(low)
+    if cat:
+        return cat
+    for token in ("bus", "lunch", "lanch", "luch", "snack", "metro", "bike", "rickshaw", "train"):
         if re.search(rf"\b{re.escape(token)}\b", low):
-            return token
+            return normalize_expense_category(token) or token
+    return None
+
+
+def _parse_modify_request_regex(message: str, items: list[dict]) -> dict[str, Any] | None:
+    """Regex fallback when LLM is unavailable or returns nothing."""
+    raw = message or ""
+    low = raw.lower()
+    if not items:
+        return None
+
+    numbered_idx = _numbered_item_index(raw, item_count=len(items))
+    if numbered_idx is not None:
+        item_num = numbered_idx + 1
+        amount = _extract_modify_amount(raw, item_number_1based=item_num)
+        if amount is not None:
+            return {
+                "item_index": numbered_idx,
+                "amount": amount,
+                "label": f"expense {item_num}",
+                "needs_confirm": False,
+            }
+
+    amount_early = _extract_modify_amount(raw, item_number_1based=None)
+    if amount_early is not None and (
+        _LAST_REF_RE.search(raw)
+        or _FIRST_REF_RE.search(raw)
+        or _category_from_message(low)
+    ):
+        resolved = resolve_expense_item_reference(raw, items)
+        if resolved.get("needs_clarify"):
+            return {
+                "needs_clarify": True,
+                "candidate_indices": list(resolved.get("candidate_indices") or []),
+                "amount": amount_early,
+                "category": resolved.get("category"),
+                "label": resolved.get("label") or "item",
+            }
+        if resolved.get("item_index") is not None:
+            return {
+                "item_index": int(resolved["item_index"]),
+                "amount": amount_early,
+                "label": str(resolved.get("label") or "item"),
+                "needs_confirm": False,
+            }
+
+    ord_m = _MODIFY_ORDINAL_RE.search(raw)
+    if ord_m:
+        return {
+            "item_index": 0,
+            "amount": float(ord_m.group(2)),
+            "label": "1st item",
+            "needs_confirm": True,
+        }
+
+    item_num = None
+    num_m = re.search(r"\b(\d+)\s*(?:no|number|nombor)\b", low)
+    if num_m:
+        item_num = int(num_m.group(1))
+
+    amount = _extract_modify_amount(raw, item_number_1based=item_num)
+    if amount is None:
+        return None
+
+    from chat.services.platform.field_extractors.expense import (
+        is_travel_category,
+        normalize_expense_category,
+    )
+
+    if re.search(r"\bbus\b", low):
+        bus_indices = []
+        for idx, item in enumerate(items):
+            desc = str(item.get("description") or "").lower()
+            cat = normalize_expense_category(item.get("category")) or ""
+            if cat == "bus" or (is_travel_category(cat) and "bus" in desc):
+                bus_indices.append(idx)
+        if len(bus_indices) > 1:
+            return {
+                "needs_clarify": True,
+                "candidate_indices": bus_indices,
+                "amount": amount,
+                "category": "bus",
+                "label": "bus",
+            }
+        if len(bus_indices) == 1:
+            return {"item_index": bus_indices[0], "amount": amount, "label": "bus"}
+
+    for idx, item in enumerate(items):
+        desc = str(item.get("description") or "").lower()
+        cat = normalize_expense_category(item.get("category")) or ""
+        if re.search(r"\blunch\b", low) and (cat == "lunch" or "lunch" in desc):
+            return {"item_index": idx, "amount": amount, "label": "lunch"}
+        if re.search(r"\bnasta|nasto|nosto|snack\b", low) and (
+            cat == "snack" or "snack" in desc or "nasta" in desc
+        ):
+            return {"item_index": idx, "amount": amount, "label": "snack"}
+
+    if is_vague_amount_modify(raw):
+        return None
+    if len(items) == 1:
+        return {"item_index": 0, "amount": amount, "label": "item"}
     return None
 
 
@@ -316,101 +543,23 @@ def parse_route_modify_request(message: str, items: list[dict]) -> dict[str, Any
     }
 
 
-def parse_modify_request(message: str, items: list[dict]) -> dict[str, Any] | None:
-    """Return {item_index, amount, label} or clarify hint — None if vague."""
-    raw = message or ""
-    low = raw.lower()
+def parse_modify_request(
+    message: str,
+    items: list[dict],
+    *,
+    trace_id: str = "",
+    prefer_llm: bool = True,
+) -> dict[str, Any] | None:
+    """Return {item_index, amount, label} or clarify hint — LLM first, regex fallback."""
     if not items:
         return None
 
-    numbered_idx = _numbered_item_index(raw, item_count=len(items))
-    if numbered_idx is not None:
-        item_num = numbered_idx + 1
-        amount = _extract_modify_amount(raw, item_number_1based=item_num)
-        if amount is not None:
-            return {
-                "item_index": numbered_idx,
-                "amount": amount,
-                "label": f"expense {item_num}",
-                "needs_confirm": False,
-            }
+    if prefer_llm:
+        from chat.services.platform.field_extractors.expense import _llm_client_configured
 
-    amount_early = _extract_modify_amount(raw, item_number_1based=None)
-    if amount_early is not None and (
-        _LAST_REF_RE.search(raw)
-        or _FIRST_REF_RE.search(raw)
-        or _category_from_message(low)
-    ):
-        resolved = resolve_expense_item_reference(raw, items)
-        if resolved.get("needs_clarify"):
-            return {
-                "needs_clarify": True,
-                "candidate_indices": list(resolved.get("candidate_indices") or []),
-                "amount": amount_early,
-                "category": resolved.get("category"),
-                "label": resolved.get("label") or "item",
-            }
-        if resolved.get("item_index") is not None:
-            return {
-                "item_index": int(resolved["item_index"]),
-                "amount": amount_early,
-                "label": str(resolved.get("label") or "item"),
-                "needs_confirm": False,
-            }
+        if _llm_client_configured():
+            llm_result = _parse_modify_request_llm(message, items, trace_id=trace_id)
+            if llm_result is not None:
+                return llm_result
 
-    ord_m = _MODIFY_ORDINAL_RE.search(raw)
-    if ord_m:
-        return {
-            "item_index": 0,
-            "amount": float(ord_m.group(2)),
-            "label": "1st item",
-            "needs_confirm": True,
-        }
-
-    item_num = None
-    num_m = re.search(r"\b(\d+)\s*(?:no|number|nombor)\b", low)
-    if num_m:
-        item_num = int(num_m.group(1))
-
-    amount = _extract_modify_amount(raw, item_number_1based=item_num)
-    if amount is None:
-        return None
-
-    from chat.services.platform.field_extractors.expense import (
-        is_travel_category,
-        normalize_expense_category,
-    )
-
-    if re.search(r"\bbus\b", low):
-        bus_indices = []
-        for idx, item in enumerate(items):
-            desc = str(item.get("description") or "").lower()
-            cat = normalize_expense_category(item.get("category")) or ""
-            if cat == "bus" or (is_travel_category(cat) and "bus" in desc):
-                bus_indices.append(idx)
-        if len(bus_indices) > 1:
-            return {
-                "needs_clarify": True,
-                "candidate_indices": bus_indices,
-                "amount": amount,
-                "category": "bus",
-                "label": "bus",
-            }
-        if len(bus_indices) == 1:
-            return {"item_index": bus_indices[0], "amount": amount, "label": "bus"}
-
-    for idx, item in enumerate(items):
-        desc = str(item.get("description") or "").lower()
-        cat = normalize_expense_category(item.get("category")) or ""
-        if re.search(r"\blunch\b", low) and (cat == "lunch" or "lunch" in desc):
-            return {"item_index": idx, "amount": amount, "label": "lunch"}
-        if re.search(r"\bnasta|nasto|nosto|snack\b", low) and (
-            cat == "snack" or "snack" in desc or "nasta" in desc
-        ):
-            return {"item_index": idx, "amount": amount, "label": "snack"}
-
-    if is_vague_amount_modify(raw):
-        return None
-    if len(items) == 1:
-        return {"item_index": 0, "amount": amount, "label": "item"}
-    return None
+    return _parse_modify_request_regex(message, items)

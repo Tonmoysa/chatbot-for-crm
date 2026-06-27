@@ -47,6 +47,16 @@ def resolve_hr_assistant_scope(
     if is_expense_pending_field_value_answer(raw, memory):
         return None
 
+    from chat.services.platform.field_extractors.expense import is_expense_review_edit_turn
+
+    if is_expense_review_edit_turn(raw, memory):
+        return None
+
+    from chat.services._policy_interrupt import is_informational_interrupt_message
+
+    if is_informational_interrupt_message(raw):
+        return None
+
     from chat.services.llm_client import LLMClient
 
     client = LLMClient()

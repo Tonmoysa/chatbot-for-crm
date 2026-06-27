@@ -618,6 +618,17 @@ def _llm_client_configured() -> bool:
 
 
 LEAVE_COLLECT_PREFILL_FIELDS = frozenset({"start_date", "end_date"})
+LEAVE_COLLECT_FIELDS = frozenset(
+    {
+        "leave_type",
+        "day_scope",
+        "half_day_period",
+        "start_date",
+        "end_date",
+        "reason",
+        "medical_document",
+    }
+)
 
 
 def _pending_collect_allowed_fields(field: str) -> set[str]:
@@ -626,6 +637,49 @@ def _pending_collect_allowed_fields(field: str) -> set[str]:
         allowed.add("half_day_period")
     allowed.update(LEAVE_COLLECT_PREFILL_FIELDS)
     return {f for f in allowed if f}
+
+
+def _leave_collect_correction_fields(draft_fields: dict[str, Any], pending_field: str) -> set[str]:
+    """Already-filled leave fields the user may correct while another slot is pending."""
+    filled = {
+        k
+        for k, v in (draft_fields or {}).items()
+        if k in LEAVE_COLLECT_FIELDS and v not in (None, "")
+    }
+    filled.discard((pending_field or "").strip())
+    return filled
+
+
+def _parse_collect_slot_llm_turn(parsed_llm: dict[str, Any], *, pending_field: str) -> dict[str, Any]:
+    """Normalize collect-slot LLM JSON into {field, value, answers_pending_field}."""
+    if not isinstance(parsed_llm, dict):
+        return {"answers_pending_field": None, "field": "", "value": None}
+
+    apf_raw = parsed_llm.get("answers_pending_field")
+    if apf_raw is True:
+        answers_pending_field = True
+    elif apf_raw is False:
+        answers_pending_field = False
+    else:
+        answers_pending_field = None
+
+    out_field = str(parsed_llm.get("field") or "").strip()
+    value = parsed_llm.get("value")
+
+    if not out_field and value in (None, ""):
+        return {"answers_pending_field": answers_pending_field or False, "field": "", "value": None}
+
+    if answers_pending_field is not False and not out_field:
+        out_field = pending_field
+
+    if answers_pending_field is True and out_field and out_field != pending_field:
+        out_field = pending_field
+
+    return {
+        "answers_pending_field": answers_pending_field,
+        "field": out_field,
+        "value": value,
+    }
 
 
 def _coerce_collect_slot_value(
@@ -665,41 +719,103 @@ def interpret_leave_collect_message(
     *,
     trace_id: str = "",
 ) -> dict[str, Any]:
-    """Semantic collect-slot fill — LLM only."""
+    """Semantic collect-slot fill — LLM only. Returns field deltas (legacy flat dict)."""
+    turn = resolve_leave_collect_turn(message, memory, trace_id=trace_id)
+    return dict(turn.get("updates") or {})
+
+
+def resolve_leave_collect_turn(
+    message: str,
+    memory,
+    *,
+    trace_id: str = "",
+    understanding_updates: list | None = None,
+) -> dict[str, Any]:
+    """Collect-slot turn: pending answer OR correction of a prior field.
+
+    Returns {
+        "updates": {field: value, ...},
+        "answers_pending_field": bool | None,
+        "is_correction": bool,
+    }
+    """
     from chat.services.platform.banglish_normalize import normalize_banglish_message
+    from chat.services.platform.schemas import FieldUpdate
     from chat.services.platform.turn_semantics import understanding_session_context
+
+    empty: dict[str, Any] = {
+        "updates": {},
+        "answers_pending_field": None,
+        "is_correction": False,
+    }
 
     pq = memory.pending_question
     if not pq or pq.workflow_id != "leave" or not pq.field:
-        return {}
+        return empty
     if is_leave_review_mode(memory):
-        return {}
+        return empty
 
-    field = str(pq.field)
+    pending_field = str(pq.field)
     raw = normalize_banglish_message((message or "").strip())
     if not raw:
-        return {}
+        return empty
 
-    if field == "reason" and is_reason_skip_message(raw):
-        return {"reason_skipped": True}
-    if field == "medical_document" and is_medical_document_skip_message(raw):
-        return {"medical_document_skipped": True}
+    if pending_field == "reason" and is_reason_skip_message(raw):
+        return {"updates": {"reason_skipped": True}, "answers_pending_field": True, "is_correction": False}
+    if pending_field == "medical_document" and is_medical_document_skip_message(raw):
+        return {
+            "updates": {"medical_document_skipped": True},
+            "answers_pending_field": True,
+            "is_correction": False,
+        }
+
+    draft = memory.active_draft()
+    draft_fields = dict((draft.fields if draft else {}) or {})
+    correction_fields = _leave_collect_correction_fields(draft_fields, pending_field)
+    allowed = _pending_collect_allowed_fields(pending_field)
+
+    if understanding_updates:
+        pending_updates: dict[str, Any] = {}
+        correction_updates: dict[str, Any] = {}
+        for upd in understanding_updates:
+            if upd.value in (None, ""):
+                continue
+            fname = str(upd.field)
+            coerced = _coerce_collect_slot_value(fname, upd.value, message=raw)
+            if coerced is None:
+                continue
+            if fname == pending_field:
+                pending_updates[fname] = coerced
+            elif fname in correction_fields:
+                correction_updates[fname] = coerced
+
+        if correction_updates:
+            return {
+                "updates": correction_updates,
+                "answers_pending_field": False,
+                "is_correction": True,
+            }
+        if pending_updates:
+            return {
+                "updates": pending_updates,
+                "answers_pending_field": True,
+                "is_correction": False,
+            }
 
     if not _llm_client_configured():
-        return {}
+        return empty
 
     import json
 
     from chat.services.llm_client import LLMClient
     from chat.services.platform.llm_prompts import LEAVE_COLLECT_SLOT_SYSTEM
 
-    draft = memory.active_draft()
     ctx = understanding_session_context(memory, None)
     payload = {
         "message": raw,
-        "pending_field": field,
+        "pending_field": pending_field,
         "pending_prompt": pq.prompt,
-        "draft_fields": dict((draft.fields if draft else {}) or {}),
+        "draft_fields": draft_fields,
         "today_iso": date.today().isoformat(),
         **ctx,
     }
@@ -709,19 +825,40 @@ def interpret_leave_collect_message(
         trace_id=trace_id or "",
     )
     if not isinstance(parsed_llm, dict):
-        return {}
+        return empty
 
-    out_field = str(parsed_llm.get("field") or field).strip()
-    if out_field != field and parsed_llm.get("field"):
-        return {}
+    slot = _parse_collect_slot_llm_turn(parsed_llm, pending_field=pending_field)
+    out_field = str(slot.get("field") or "").strip()
+    value = slot.get("value")
+    answers_pending_field = slot.get("answers_pending_field")
 
-    value = parsed_llm.get("value")
-    if field == "reason" and value in (None, "") and is_reason_skip_message(raw):
-        return {"reason_skipped": True}
-    coerced = _coerce_collect_slot_value(field, value, message=raw)
-    if coerced is not None:
-        return {field: coerced}
-    return {}
+    if not out_field:
+        return {
+            "updates": {},
+            "answers_pending_field": answers_pending_field if answers_pending_field is not None else False,
+            "is_correction": False,
+        }
+
+    is_correction = bool(
+        answers_pending_field is False
+        or (out_field != pending_field and out_field in correction_fields)
+    )
+    if out_field != pending_field and not is_correction:
+        return empty
+
+    target_field = out_field if is_correction else pending_field
+    if target_field == "reason" and value in (None, "") and is_reason_skip_message(raw):
+        return {"updates": {"reason_skipped": True}, "answers_pending_field": True, "is_correction": False}
+
+    coerced = _coerce_collect_slot_value(target_field, value, message=raw)
+    if coerced is None:
+        return empty
+
+    return {
+        "updates": {target_field: coerced},
+        "answers_pending_field": False if is_correction else True,
+        "is_correction": is_correction,
+    }
 
 
 def collect_slot_field_updates(
@@ -731,28 +868,28 @@ def collect_slot_field_updates(
     trace_id: str = "",
     understanding_updates: list | None = None,
 ) -> list:
-    """Primary collect-slot path — understanding patch for pending field, then slot LLM."""
+    """Primary collect-slot path — pending answer or prior-field correction."""
     from chat.services.platform.schemas import FieldUpdate
 
-    pq = memory.pending_question
-    if not pq or pq.workflow_id != "leave" or not pq.field:
-        return []
-
-    allowed = _pending_collect_allowed_fields(pq.field)
-    updates: list[FieldUpdate] = []
-    for upd in understanding_updates or []:
-        if upd.field in allowed and upd.value not in (None, ""):
-            coerced = _coerce_collect_slot_value(str(upd.field), upd.value, message=message)
-            if coerced is not None:
-                updates.append(FieldUpdate(field=str(upd.field), value=coerced, action="set"))
-
-    if updates:
-        return updates
-
-    delta = interpret_leave_collect_message(message, memory, trace_id=trace_id)
+    turn = resolve_leave_collect_turn(
+        message,
+        memory,
+        trace_id=trace_id,
+        understanding_updates=understanding_updates,
+    )
     return [
         FieldUpdate(field=str(k), value=v, action="set")
-        for k, v in delta.items()
+        for k, v in (turn.get("updates") or {}).items()
+        if v not in (None, "")
+    ]
+
+
+def leave_collect_turn_to_field_updates(turn: dict[str, Any]) -> list:
+    from chat.services.platform.schemas import FieldUpdate
+
+    return [
+        FieldUpdate(field=str(k), value=v, action="set")
+        for k, v in (turn.get("updates") or {}).items()
         if v not in (None, "")
     ]
 
@@ -790,7 +927,9 @@ def sanitize_leave_review_updates(
     return [
         FieldUpdate(field=str(k), value=v, action="set")
         for k, v in coerced.items()
-        if k in allowed and v not in (None, "")
+        if k in allowed
+        and v not in (None, "")
+        and str(draft_fields.get(k)) != str(v)
     ]
 
 
