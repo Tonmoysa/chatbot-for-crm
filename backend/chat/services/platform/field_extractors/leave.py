@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 LEAVE_INTERNAL_DRAFT_FIELDS = frozenset({"reason_skipped", "medical_document_skipped"})
@@ -150,10 +150,94 @@ def apply_multi_day_scope_to_fields(fields: dict[str, Any], message: str = "") -
     return out
 
 
-def apply_leave_derived_fields(draft: Any, *, message: str = "") -> None:
+def _end_date_from_duration(start_iso: str, duration_days: int) -> str | None:
+    if duration_days < 1:
+        return None
+    try:
+        start = date.fromisoformat(str(start_iso)[:10])
+    except ValueError:
+        return None
+    return (start + timedelta(days=duration_days - 1)).isoformat()
+
+
+def infer_leave_end_date_via_llm(
+    message: str,
+    *,
+    start_date: str,
+    draft_fields: dict[str, Any] | None = None,
+    trace_id: str = "",
+) -> str | None:
+    """LLM infers inclusive end_date from duration phrases (e.g. kal theke 3 din)."""
+    if not _llm_client_configured():
+        return None
+    raw = (message or "").strip()
+    if not raw or not start_date:
+        return None
+    import json
+
+    from chat.services.llm_client import LLMClient
+    from chat.services.platform.banglish_normalize import normalize_banglish_message
+    from chat.services.platform.llm_prompts import LEAVE_END_DATE_INFER_SYSTEM
+
+    normalized = normalize_banglish_message(raw)
+    payload = {
+        "message": normalized,
+        "start_date": str(start_date)[:10],
+        "draft_fields": dict(draft_fields or {}),
+        "today_iso": date.today().isoformat(),
+    }
+    parsed = LLMClient().chat_json(
+        system_prompt=LEAVE_END_DATE_INFER_SYSTEM,
+        user_prompt=json.dumps(payload, ensure_ascii=False, default=str),
+        trace_id=trace_id or "",
+    )
+    if not isinstance(parsed, dict):
+        return None
+    end = _coerce_llm_date_output(parsed.get("end_date"))
+    if end:
+        return end
+    duration = parsed.get("duration_days")
+    if isinstance(duration, (int, float)) and int(duration) >= 1:
+        return _end_date_from_duration(str(start_date)[:10], int(duration))
+    return None
+
+
+def derive_leave_end_date_fields(
+    fields: dict[str, Any],
+    message: str = "",
+    *,
+    trace_id: str = "",
+) -> dict[str, Any]:
+    """Fill end_date from LLM duration inference; single-day defaults to start_date."""
+    out = dict(fields or {})
+    start = out.get("start_date")
+    if not start or out.get("end_date"):
+        return out
+    inferred = None
+    if (message or "").strip():
+        inferred = infer_leave_end_date_via_llm(
+            message,
+            start_date=str(start)[:10],
+            draft_fields=out,
+            trace_id=trace_id,
+        )
+    out["end_date"] = inferred or str(start)[:10]
+    return out
+
+
+def apply_leave_derived_fields(draft: Any, *, message: str = "", trace_id: str = "") -> None:
     if not draft or draft.workflow_id != "leave" or draft.locked:
         return
     if scrub_invalid_leave_reason_from_fields(draft.fields):
+        draft.version += 1
+    before_end = draft.fields.get("end_date")
+    updated_dates = derive_leave_end_date_fields(
+        draft.fields,
+        message,
+        trace_id=trace_id,
+    )
+    if updated_dates.get("end_date") and not before_end:
+        draft.fields["end_date"] = updated_dates["end_date"]
         draft.version += 1
     before = draft.fields.get("day_scope")
     updated = apply_multi_day_scope_to_fields(draft.fields, message)
@@ -1079,6 +1163,7 @@ def merge_leave_field_dicts(
     message: str,
     *,
     memory=None,
+    trace_id: str = "",
 ) -> dict[str, Any]:
     """Validate and coerce LLM field patches only."""
     _ = rules_fields
@@ -1113,6 +1198,7 @@ def merge_leave_field_dicts(
         if doc:
             out["medical_document"] = doc
 
+    out = derive_leave_end_date_fields(out, message, trace_id=trace_id)
     return apply_multi_day_scope_to_fields(out, message)
 
 

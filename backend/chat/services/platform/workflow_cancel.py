@@ -45,6 +45,16 @@ def _last_assistant_lower(conversation_history: list[str] | None) -> str:
     return (last_assistant_message(conversation_history) or "").lower()
 
 
+def _session_supports_cancel_routing(memory) -> bool:
+    """Session has a cancellable draft or submitted expense history worth routing cancel."""
+    from chat.services.platform.workflow_show import session_has_workflow_context
+
+    if session_has_workflow_context(memory):
+        return True
+    facts = getattr(memory, "conversation_facts", None) or {}
+    return bool(list(facts.get("submitted_expenses") or []))
+
+
 def _rules_workflow_cancel_target(
     message: str,
     memory=None,
@@ -52,12 +62,12 @@ def _rules_workflow_cancel_target(
     conversation_history: list[str] | None = None,
 ) -> str | None:
     from chat.services.platform.intent_rules import is_cancel_workflow_message
-    from chat.services.platform.workflow_show import session_has_workflow_context, session_leave_draft
+    from chat.services.platform.workflow_show import session_leave_draft
 
     raw = (message or "").strip()
     if not raw or not message_might_request_workflow_cancel(raw):
         return None
-    if memory and not session_has_workflow_context(memory):
+    if memory and not _session_supports_cancel_routing(memory):
         return None
 
     for wf in ("leave", "expense"):
@@ -138,16 +148,21 @@ def resolve_workflow_cancel_target(
     if memory and getattr(memory, "active_workflow", None):
         active = active or str(memory.active_workflow.id or "").strip().lower()
 
-    from chat.services.platform.workflow_show import session_has_workflow_context
+    from chat.services.platform.field_extractors.expense import expense_has_cancellable_draft
 
-    if not rules and not session_has_workflow_context(memory):
+    if not rules and not _session_supports_cancel_routing(memory):
         if key:
             _CANCEL_SEMANTICS_CACHE[key] = None
         return None
 
+    submitted_expenses = list(
+        (getattr(memory, "conversation_facts", None) or {}).get("submitted_expenses") or []
+    )
     payload: dict[str, Any] = {
         "message": (message or "").strip(),
         "active_workflow": active or None,
+        "has_submitted_expenses": bool(submitted_expenses),
+        "has_cancellable_expense_draft": expense_has_cancellable_draft(memory),
         "suspended_workflows": [
             {"workflow_id": sw.get("workflow_id"), "stage": sw.get("stage")}
             for sw in (getattr(memory, "suspended_workflows", None) or [])

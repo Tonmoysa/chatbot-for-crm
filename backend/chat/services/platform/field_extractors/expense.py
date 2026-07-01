@@ -90,20 +90,38 @@ _ROUTE_JUNK_WORDS = frozenset({
     "lagse", "lagbe", "korlam", "korechi", "hoyeche", "hoise", "diyechi", "te", "e",
 })
 
-# Commute endpoints users state explicitly (e.g. mirpur to office) — not narrative junk.
+# Commute endpoints users state explicitly (e.g. mirpur to office, office to badda).
 _WORKPLACE_ROUTE_ENDPOINTS = frozenset({"office"})
+
+_ROUTE_LOCATION_ALIASES = {
+    "baada": "badda",
+    "bada": "badda",
+    "golshan": "gulshan",
+    "gulsan": "gulshan",
+    "uttra": "uttora",
+    "uttara": "uttora",
+}
+
+
+def normalize_route_location(loc: str | None) -> str:
+    raw = str(loc or "").strip().lower()
+    if not raw:
+        return ""
+    return _ROUTE_LOCATION_ALIASES.get(raw, raw)
 
 
 def is_valid_expense_route(from_loc: str | None, to_loc: str | None) -> bool:
     """Reject hallucinated or fragment routes (e.g. office → jawar)."""
-    frm = str(from_loc or "").strip().lower()
-    to = str(to_loc or "").strip().lower()
+    frm = normalize_route_location(from_loc)
+    to = normalize_route_location(to_loc)
     if not frm or not to or frm == to:
         return False
-    if frm in _WORKPLACE_ROUTE_ENDPOINTS or (
-        frm == "office" and to in _ROUTE_JUNK_WORDS
-    ):
-        return False
+    if frm in _WORKPLACE_ROUTE_ENDPOINTS:
+        return (
+            len(to) >= 3
+            and to not in _ROUTE_JUNK_WORDS
+            and not any(part in _ROUTE_JUNK_WORDS for part in to.split())
+        )
     if frm in _ROUTE_JUNK_WORDS:
         return False
     if to in _WORKPLACE_ROUTE_ENDPOINTS:
@@ -124,8 +142,8 @@ def is_valid_expense_route(from_loc: str | None, to_loc: str | None) -> bool:
 def _coerce_route_dict(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
-    frm = str(value.get("from_location") or "").strip()[:120]
-    to = str(value.get("to_location") or "").strip()[:120]
+    frm = normalize_route_location(value.get("from_location"))[:120]
+    to = normalize_route_location(value.get("to_location"))[:120]
     if not is_valid_expense_route(frm, to):
         return {}
     return {"from_location": frm, "to_location": to}
@@ -135,6 +153,7 @@ def coerce_expense_modify_turn(message: str, memory, *, trace_id: str = "") -> d
     """LLM-first item update — regex only when LLM unavailable."""
     from chat.services.platform.field_extractors.modify import (
         looks_like_expense_item_modify,
+        looks_like_expense_route_modify,
         parse_modify_request,
     )
     from chat.services.platform.intent_rules import is_modify_request
@@ -146,7 +165,11 @@ def coerce_expense_modify_turn(message: str, memory, *, trace_id: str = "") -> d
     if not items:
         return None
     llm_ready = _llm_client_configured()
-    if not is_modify_request(message) and not looks_like_expense_item_modify(message):
+    if (
+        not is_modify_request(message)
+        and not looks_like_expense_item_modify(message)
+        and not looks_like_expense_route_modify(message)
+    ):
         if not llm_ready:
             return None
     parsed = parse_modify_request(message, items, trace_id=trace_id, prefer_llm=llm_ready)
@@ -173,8 +196,10 @@ def coerce_expense_modify_turn(message: str, memory, *, trace_id: str = "") -> d
                 match_amount=parsed.get("match_amount"),
             ),
         }
-    if parsed.get("amount") is None and not (
-        parsed.get("from_location") and parsed.get("to_location")
+    if (
+        parsed.get("amount") is None
+        and not (parsed.get("from_location") and parsed.get("to_location"))
+        and not parsed.get("category")
     ):
         return None
     idx = int(parsed["item_index"])
@@ -188,9 +213,16 @@ def coerce_expense_modify_turn(message: str, memory, *, trace_id: str = "") -> d
         patch["amount"] = float(parsed["amount"])
     if parsed.get("category"):
         patch["category"] = parsed["category"]
-    if parsed.get("from_location") and parsed.get("to_location"):
-        patch["from_location"] = parsed["from_location"]
-        patch["to_location"] = parsed["to_location"]
+    route = _coerce_route_dict(
+        {
+            "from_location": parsed.get("from_location"),
+            "to_location": parsed.get("to_location"),
+        }
+    )
+    if route:
+        patch.update(route)
+    if len(patch) <= 2:
+        return None
     intent = "modify_review" if is_expense_review_mode(memory) else "update"
     return {"intent": intent, "item_patches": [patch]}
 
@@ -302,7 +334,77 @@ def is_expense_regret_remove_message(message: str) -> bool:
     return any(re.search(p, low) for p in patterns)
 
 
-def _matches_pending_expense_slot_value(message: str, memory) -> bool:
+def _skip_pending_modify_llm(message: str, memory) -> bool:
+    """Fast path — messages that never need expense-modify LLM during a pending slot."""
+    from chat.services.platform.field_extractors.modify import (
+        message_references_explicit_expense_number,
+    )
+    from chat.services.platform.intent_rules import (
+        is_bare_confirmation,
+        is_bare_rejection,
+        is_cancel_workflow_message,
+        is_delete_request,
+        is_greeting_or_chitchat,
+        is_workflow_show_request,
+        message_has_banglish_submit_phrase,
+        parse_submit_workflow,
+    )
+
+    raw = (message or "").strip()
+    if not raw:
+        return True
+    if (
+        is_bare_confirmation(raw)
+        or is_bare_rejection(raw)
+        or is_greeting_or_chitchat(raw)
+        or is_delete_request(raw)
+        or is_cancel_workflow_message(raw)
+        or message_has_banglish_submit_phrase(raw)
+        or parse_submit_workflow(raw, active_workflow_id="expense")
+        or is_workflow_show_request(raw, workflow_id="expense")
+    ):
+        return True
+    if not message_references_explicit_expense_number(raw):
+        return True
+    return False
+
+
+def pending_slot_overridden_by_numbered_modify(
+    message: str,
+    memory,
+    *,
+    trace_id: str = "",
+) -> bool:
+    """True when LLM resolves a numbered edit on a line other than the open pending slot."""
+    pq = memory.pending_question if memory else None
+    if not pq or pq.workflow_id != "expense" or pq.item_index is None:
+        return False
+    if _skip_pending_modify_llm(message, memory):
+        return False
+    if not _llm_client_configured():
+        return False
+    draft = memory.active_draft() if memory else None
+    if not draft:
+        return False
+    items = list(draft.fields.get("items") or [])
+    if not items:
+        return False
+    from chat.services.platform.field_extractors.modify import parse_modify_request
+
+    parsed = parse_modify_request(message, items, trace_id=trace_id, prefer_llm=True)
+    if not parsed or parsed.get("needs_clarify"):
+        return False
+    try:
+        resolved = int(parsed["item_index"])
+    except (TypeError, ValueError, KeyError):
+        return False
+    pending_idx = int(pq.item_index)
+    if not (0 <= resolved < len(items)):
+        return False
+    return resolved != pending_idx
+
+
+def _matches_pending_expense_slot_value(message: str, memory, *, trace_id: str = "") -> bool:
     """True when message directly answers the open expense item slot (route/amount/category)."""
     from chat.services.platform.banglish_normalize import normalize_banglish_message
 
@@ -310,6 +412,14 @@ def _matches_pending_expense_slot_value(message: str, memory) -> bool:
     if not pq or pq.workflow_id != "expense" or pq.item_index is None:
         return False
     raw = normalize_banglish_message((message or "").strip())
+    from chat.services.platform.field_extractors.modify import (
+        message_references_explicit_expense_number,
+    )
+
+    if message_references_explicit_expense_number(raw) and pending_slot_overridden_by_numbered_modify(
+        message, memory, trace_id=trace_id
+    ):
+        return False
     if not raw:
         return False
     draft = memory.active_draft() if memory else None
@@ -338,7 +448,12 @@ def _matches_pending_expense_slot_value(message: str, memory) -> bool:
     return False
 
 
-def is_expense_pending_field_value_answer(message: str, memory) -> bool:
+def is_expense_pending_field_value_answer(
+    message: str,
+    memory,
+    *,
+    trace_id: str = "",
+) -> bool:
     """True only when message is a direct slot answer — not edit/navigation."""
     from chat.services.platform.intent_rules import is_workflow_show_request
 
@@ -347,14 +462,23 @@ def is_expense_pending_field_value_answer(message: str, memory) -> bool:
         return False
     if is_workflow_show_request(message, workflow_id="expense"):
         return False
-    if is_expense_draft_mutation_message(message, memory):
+    if pending_slot_overridden_by_numbered_modify(message, memory, trace_id=trace_id):
         return False
-    return _matches_pending_expense_slot_value(message, memory)
+    if is_expense_draft_mutation_message(message, memory, trace_id=trace_id):
+        return False
+    return _matches_pending_expense_slot_value(message, memory, trace_id=trace_id)
 
 
-def is_expense_draft_mutation_message(message: str, memory=None) -> bool:
+def is_expense_draft_mutation_message(
+    message: str,
+    memory=None,
+    *,
+    trace_id: str = "",
+) -> bool:
     """True when user is editing draft lines (delete/modify/correct), not navigating."""
-    if _matches_pending_expense_slot_value(message, memory):
+    if pending_slot_overridden_by_numbered_modify(message, memory, trace_id=trace_id):
+        return True
+    if _matches_pending_expense_slot_value(message, memory, trace_id=trace_id):
         return False
     from chat.services.platform.field_extractors.modify import (
         _category_from_message,
@@ -700,6 +824,19 @@ def coerce_expense_correction_turn(
     memory,
 ) -> dict[str, Any]:
     """Normalize LLM output and force update intent when patches target existing lines."""
+    intent = str((turn or {}).get("intent") or "").lower()
+    if intent == "add" or turn.get("wizard_fallback"):
+        patches = [
+            p
+            for p in ((turn or {}).get("item_patches") or [])
+            if isinstance(p, dict)
+        ]
+        if patches and all(
+            str(p.get("action") or "append").lower() in ("append", "add", "")
+            and p.get("item_index") is None
+            for p in patches
+        ):
+            return dict(turn or {})
     turn = normalize_expense_correction_turn(turn, memory)
     if not expense_turn_has_targeted_patches(turn, memory):
         return turn
@@ -769,6 +906,13 @@ def coerce_compound_expense_add_turn(
         body = _patch_body(patch)
         if body:
             patches_out.append(patch)
+
+    if patches_out:
+        patches_out = enrich_append_patches_from_message(message, patches_out)
+        if len(patches_out) == 1 and not _patch_body(patches_out[0]).get("category"):
+            rules = extract_expense_single_item_rules(message)
+            if rules and rules[0].get("category"):
+                patches_out = rules
 
     if not patches_out:
         wizard = build_wizard_fallback_turn(message, memory, trace_id=trace_id)
@@ -867,33 +1011,7 @@ def _should_compound_add_over_mutation(
         return False
     if _message_looks_like_amount_correction(message):
         return False
-    msg_cat = infer_category_from_clause(message)
-    if not msg_cat:
-        from chat.services.platform.field_extractors.modify import _category_from_message
-
-        msg_cat = _category_from_message((message or "").strip().lower())
-    msg_cat = normalize_expense_category(msg_cat)
-    draft = memory.active_draft() if memory else None
-    items = list((draft.fields.get("items") or []) if draft else [])
-    pq = memory.pending_question if memory else None
-    if pq and pq.workflow_id == "expense" and pq.item_index is not None and msg_cat:
-        idx = int(pq.item_index)
-        if 0 <= idx < len(items):
-            pending_cat = normalize_expense_category(items[idx].get("category"))
-            if pending_cat and msg_cat != pending_cat:
-                return True
-    if msg_cat:
-        existing = {
-            normalize_expense_category(it.get("category"))
-            for it in items
-            if isinstance(it, dict)
-        }
-        if msg_cat not in existing:
-            return True
-        return False
-    if not expense_turn_is_draft_mutation(turn, message):
-        return True
-    return False
+    return True
 
 
 def _message_targets_existing_draft_category(message: str, memory) -> bool:
@@ -924,9 +1042,13 @@ def finalize_expense_turn_patches(
 ) -> dict[str, Any]:
     """Apply compound-add or correction coercion — mutually exclusive."""
     intent = str((turn or {}).get("intent") or "").lower()
+    if intent in ("clarify_delete", "clarify_modify"):
+        return dict(turn or {})
     if intent in ("date_not_allowed", "date_correction", "replay_blocked_add") or (turn or {}).get(
         "date_policy_rejected"
     ):
+        return dict(turn or {})
+    if expense_turn_is_draft_mutation(turn, message):
         return dict(turn or {})
     if _should_compound_add_over_mutation(turn, message, memory):
         from chat.services.platform.intent_rules import is_expense_add_request
@@ -937,11 +1059,7 @@ def finalize_expense_turn_patches(
         if _turn_has_actionable_patches(wizard):
             return {**wizard, "intent": "add"}
         return coerce_compound_expense_add_turn(turn, message, memory, trace_id=trace_id)
-    if expense_turn_is_draft_mutation(turn, message):
-        return dict(turn or {})
-    if message_has_new_expense_items(message) and not _message_targets_existing_draft_category(
-        message, memory
-    ):
+    if message_has_new_expense_items(message):
         return coerce_compound_expense_add_turn(turn, message, memory, trace_id=trace_id)
     return coerce_expense_correction_turn(turn, memory)
 
@@ -1000,6 +1118,17 @@ def coerce_expense_delete_turn(message: str, memory) -> dict[str, Any] | None:
         return {"intent": "clarify_delete", "item_patches": []}
     if not is_delete_request(message) and not looks_like_expense_item_delete(message):
         return None
+    from chat.services.platform.field_extractors.modify import parse_multiple_item_indices
+
+    multi_indices = parse_multiple_item_indices(message, item_count=len(items))
+    if multi_indices:
+        return {
+            "intent": "delete",
+            "item_patches": [
+                {"action": "delete", "item_index": i} for i in multi_indices
+            ],
+            "delete_indices": multi_indices,
+        }
     parsed = parse_delete_request(message, items)
     if parsed:
         if parsed.get("needs_clarify"):
@@ -1070,15 +1199,20 @@ def expense_turn_blocks_wizard(
 def coerce_pending_expense_turn(
     message: str,
     memory,
+    *,
+    trace_id: str = "",
 ) -> dict[str, Any] | None:
     """Obvious pending-slot answers — canonical enum/amount only, not narrative parsing."""
     from chat.services.platform.banglish_normalize import normalize_banglish_message
 
-    route_turn = _coerce_expense_route_answer_turn(message, memory)
+    if pending_slot_overridden_by_numbered_modify(message, memory, trace_id=trace_id):
+        return None
+
+    route_turn = _coerce_expense_route_answer_turn(message, memory, trace_id=trace_id)
     if route_turn:
         return route_turn
 
-    if is_expense_draft_mutation_message(message, memory):
+    if is_expense_draft_mutation_message(message, memory, trace_id=trace_id):
         return None
 
     pq = memory.pending_question if memory else None
@@ -1129,12 +1263,19 @@ def coerce_pending_expense_turn(
     return None
 
 
-def _coerce_expense_route_answer_turn(message: str, memory) -> dict[str, Any] | None:
+def _coerce_expense_route_answer_turn(
+    message: str,
+    memory,
+    *,
+    trace_id: str = "",
+) -> dict[str, Any] | None:
     """Route-only replies (e.g. mirpur to badda) for the open travel slot."""
     from chat.services.platform.banglish_normalize import normalize_banglish_message
     from chat.services.platform.field_extractors.route import parse_route
     from chat.services.platform.intent_rules import is_expense_add_request
 
+    if pending_slot_overridden_by_numbered_modify(message, memory, trace_id=trace_id):
+        return None
     if is_expense_add_request(message) or message_has_new_expense_items(message):
         return None
     pq = memory.pending_question if memory else None
@@ -1490,8 +1631,30 @@ def _parse_category_amount(text: str, category: str) -> float | None:
     return parse_amount(text)
 
 
+def _all_segments_by_anchors(message: str) -> list[str]:
+    """One text span per category anchor — duplicate categories allowed (e.g. two bus lines)."""
+    anchors = _category_anchor_positions(message)
+    if not anchors:
+        return []
+    segments: list[str] = []
+    for idx, (cat_pos, _cat) in enumerate(anchors):
+        seg_start = cat_pos
+        if idx == 0:
+            prefix = message[:cat_pos]
+            last_amt = None
+            for match in _SEGMENT_AMOUNT_RE.finditer(prefix):
+                last_amt = match
+            if last_amt is not None:
+                seg_start = last_amt.start()
+        seg_end = anchors[idx + 1][0] if idx + 1 < len(anchors) else len(message)
+        segment = message[seg_start:seg_end].strip(" .…,;")
+        if segment:
+            segments.append(segment)
+    return segments
+
+
 def _segment_for_category(message: str, category: str) -> str | None:
-    """Text span for one category inside a run-on compound expense message."""
+    """Text span for the first occurrence of one category inside a compound message."""
     want = normalize_expense_category(category)
     if not want or not message:
         return None
@@ -1518,19 +1681,7 @@ def _segment_for_category(message: str, category: str) -> str | None:
 
 def _compound_expense_segments(message: str) -> list[str]:
     """Split run-on multi-category expense text into per-category spans."""
-    anchors = _category_anchor_positions(message)
-    if len(anchors) < 2:
-        return []
-    segments: list[str] = []
-    seen: set[str] = set()
-    for _, cat in anchors:
-        if cat in seen:
-            continue
-        seen.add(cat)
-        seg = _segment_for_category(message, cat)
-        if seg:
-            segments.append(seg)
-    return segments
+    return _all_segments_by_anchors(message)
 
 
 def split_expense_clauses(message: str) -> list[str]:
@@ -1691,6 +1842,101 @@ def _strip_banglish_submit_tail(message: str) -> str:
     return text
 
 
+def _strip_add_request_tail(message: str) -> str:
+    """Remove explicit add phrasing so category + amount parsing stays intact."""
+    text = (message or "").strip()
+    if not text:
+        return text
+    low = text.lower()
+    tails = (
+        "new expense hisabe add koro",
+        "notun expense hisabe add koro",
+        "expense hisabe add koro",
+        "khoroch hisabe add koro",
+        "hisabe add koro",
+        "new expense add koro",
+        "notun expense add koro",
+        "notun khoroch add koro",
+        "add korte chai",
+        "add korte",
+        "add koro",
+        "add kore",
+        "add kor",
+        "jog koro",
+        "jog kore",
+    )
+    for tail in sorted(tails, key=len, reverse=True):
+        idx = low.find(tail)
+        if idx >= 0:
+            text = text[:idx].strip(" ,;.")
+            low = text.lower()
+    return text.strip()
+
+
+def extract_expense_single_item_rules(message: str) -> list[dict[str, Any]]:
+    """Extract one expense line from a simple message (category + amount + optional route)."""
+    from chat.services.platform.field_extractors.amount import parse_amount
+    from chat.services.platform.field_extractors.modify import _category_from_message
+    from chat.services.platform.field_extractors.route import parse_route
+
+    raw = _strip_add_request_tail(_strip_banglish_submit_tail(message))
+    if not raw:
+        return []
+    cat = normalize_expense_category(
+        infer_category_from_clause(raw) or _category_from_message(raw.lower())
+    )
+    amt = _parse_category_amount(raw, cat) if cat else None
+    if amt is None:
+        amt = parse_amount(raw)
+    if amt is None:
+        return []
+    patch: dict[str, Any] = {"action": "append", "amount": amt}
+    if cat:
+        patch["category"] = cat
+    route = parse_route(raw)
+    if route and is_valid_expense_route(route[0], route[1]):
+        patch["from_location"] = route[0]
+        patch["to_location"] = route[1]
+    return [patch]
+
+
+def enrich_append_patches_from_message(
+    message: str,
+    patches: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Fill missing category, amount, or route on append patches from user text."""
+    from chat.services.platform.field_extractors.modify import _category_from_message
+    from chat.services.platform.field_extractors.route import parse_route
+
+    raw = _strip_add_request_tail(_strip_banglish_submit_tail(message))
+    if not raw or not patches:
+        return patches
+    msg_cat = normalize_expense_category(
+        infer_category_from_clause(raw) or _category_from_message(raw.lower())
+    )
+    msg_route = parse_route(raw)
+    enriched: list[dict[str, Any]] = []
+    for raw_patch in patches:
+        if not isinstance(raw_patch, dict):
+            continue
+        patch = dict(raw_patch)
+        body = _patch_body(patch)
+        cat = normalize_expense_category(body.get("category") or patch.get("category") or msg_cat)
+        if cat and not body.get("category"):
+            patch["category"] = cat
+        if not body.get("amount") and not patch.get("amount"):
+            amt = _parse_category_amount(raw, cat or "")
+            if amt is not None:
+                patch["amount"] = amt
+        if msg_route and is_valid_expense_route(msg_route[0], msg_route[1]):
+            if not patch.get("from_location"):
+                patch["from_location"] = msg_route[0]
+            if not patch.get("to_location"):
+                patch["to_location"] = msg_route[1]
+        enriched.append(patch)
+    return enriched
+
+
 def extract_expense_compound_items_rules(message: str) -> list[dict[str, Any]]:
     """Rules fallback: extract expense line items from compound Banglish messages."""
     from chat.services.platform.field_extractors.modify import _category_from_message
@@ -1701,28 +1947,29 @@ def extract_expense_compound_items_rules(message: str) -> list[dict[str, Any]]:
     if not raw or not is_compound_expense_message(raw):
         return []
 
-    patches: list[dict[str, Any]] = []
-    anchors = _category_anchor_positions(raw)
-    segments: list[str] = []
-    if len(anchors) >= 2:
-        seen_seg_cats: set[str] = set()
-        for _, cat in anchors:
-            if cat in seen_seg_cats:
-                continue
-            seen_seg_cats.add(cat)
-            seg = _segment_for_category(raw, cat)
-            if seg:
-                segments.append(seg)
+    clause_segments = split_expense_clauses(raw)
+    anchor_segments = _all_segments_by_anchors(raw)
+    if len(clause_segments) >= 2:
+        segments = clause_segments
+    elif len(anchor_segments) >= 2:
+        segments = anchor_segments
+    elif anchor_segments:
+        segments = anchor_segments
+    elif clause_segments:
+        segments = clause_segments
     else:
-        segments = split_expense_clauses(raw)
+        segments = [raw]
 
-    seen_cats: set[str] = set()
+    patches: list[dict[str, Any]] = []
     for clause in segments:
         if not clause:
             continue
         cat = infer_category_from_clause(clause) or _category_from_message(clause.lower())
         cat = normalize_expense_category(cat)
-        if not cat or cat in seen_cats:
+        if not cat:
+            amt_only = _parse_category_amount(clause, "")
+            if amt_only is not None:
+                patches.append({"action": "append", "amount": amt_only})
             continue
         amt = _parse_category_amount(clause, cat)
         if amt is None:
@@ -1733,7 +1980,6 @@ def extract_expense_compound_items_rules(message: str) -> list[dict[str, Any]]:
             patch["from_location"] = route[0]
             patch["to_location"] = route[1]
         patches.append(patch)
-        seen_cats.add(cat)
     return patches
 
 
@@ -1828,6 +2074,107 @@ def _maybe_expand_compound_items_llm(
     return {**turn, "intent": "add", "item_patches": extracted, "clarify": {}}
 
 
+def _fresh_draft_phrase_match(message: str) -> bool:
+    """Explicit fresh-start phrasing — not compound item lists."""
+    low = (message or "").strip().lower()
+    if not low:
+        return False
+    phrases = (
+        "clear draft",
+        "draft clear",
+        "fresh expense",
+        "reset expense",
+        "notun expense shuru",
+        "new expense shuru",
+        "notun khoroch shuru",
+        "agrer expense cancel",
+        "ager expense cancel",
+        "purono draft clear",
+        "purno draft clear",
+        "pending expense cancel kore",
+        "cancel kore notun expense",
+        "cancel kore new expense",
+        "cancel kore notun khoroch",
+        "purono expense cancel",
+        "purno expense cancel",
+    )
+    return any(p in low for p in phrases)
+
+
+def user_requests_fresh_expense_draft(
+    message: str,
+    memory=None,
+    *,
+    trace_id: str = "",
+) -> bool:
+    """True when user wants to discard pending draft and start fresh — not merge."""
+    raw = (message or "").strip()
+    if not raw:
+        return False
+    if _fresh_draft_phrase_match(raw):
+        return True
+    if memory is not None and not memory_has_expense_draft(memory):
+        return False
+    if not _llm_client_configured():
+        return False
+    from chat.services.llm_client import llm_rate_limit_active
+
+    if llm_rate_limit_active(trace_id or "", scope="expense-fresh-draft"):
+        return False
+
+    import json
+
+    from chat.services.llm_client import LLMClient
+    from chat.services.platform.llm_prompts import EXPENSE_FRESH_DRAFT_INTENT_SYSTEM
+
+    has_pending = False
+    item_count = 0
+    if memory is not None:
+        _, draft = resolve_expense_working_draft(memory)
+        if draft:
+            items = list((draft.fields or {}).get("items") or [])
+            item_count = len(items)
+            has_pending = item_count > 0
+    payload = {
+        "message": raw,
+        "has_pending_draft": has_pending,
+        "pending_item_count": item_count,
+    }
+    parsed = LLMClient().chat_json(
+        system_prompt=EXPENSE_FRESH_DRAFT_INTENT_SYSTEM,
+        user_prompt=json.dumps(payload, ensure_ascii=False),
+        trace_id=trace_id or "",
+        scope="expense-fresh-draft",
+    )
+    if not isinstance(parsed, dict):
+        return False
+    if not parsed.get("fresh_draft"):
+        return False
+    try:
+        conf = float(parsed.get("confidence") or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    return conf >= 0.65
+
+
+def resolve_expense_fresh_claim(
+    message: str,
+    memory,
+    active_id: str,
+    *,
+    trace_id: str = "",
+    fresh_claim_hint: bool = False,
+) -> bool:
+    """Whether to clear pending expense draft before applying this message."""
+    if user_requests_fresh_expense_draft(message, memory, trace_id=trace_id):
+        return True
+    if fresh_claim_hint:
+        return True
+    if memory is not None and memory_has_expense_draft(memory):
+        return False
+    return (active_id or "").strip().lower() != "expense"
+
+
 def build_wizard_fallback_turn(
     message: str,
     memory=None,
@@ -1850,18 +2197,72 @@ def build_wizard_fallback_turn(
     if not patches:
         patches = extract_expense_compound_items_rules(raw)
     if not patches:
+        patches = extract_expense_single_item_rules(raw)
+    if not patches:
         amt = parse_amount(raw)
         if amt is not None:
-            patches = [{"action": "append", "amount": amt}]
+            cat = normalize_expense_category(
+                infer_category_from_clause(raw)
+                or infer_category_from_clause(_strip_add_request_tail(raw))
+            )
+            patch: dict[str, Any] = {"action": "append", "amount": amt}
+            if cat:
+                patch["category"] = cat
+            patches = [patch]
 
     if not patches:
         return {"intent": "conversation", "item_patches": []}
+
+    patches = enrich_append_patches_from_message(raw, patches)
+    if len(patches) == 1 and not _patch_body(patches[0]).get("category"):
+        rules = extract_expense_single_item_rules(raw)
+        if rules and rules[0].get("category"):
+            patches = rules
 
     return {
         "intent": "add",
         "item_patches": patches,
         "wizard_fallback": True,
     }
+
+
+def ensure_expense_turn_item_patches(
+    turn: dict[str, Any],
+    message: str,
+) -> dict[str, Any]:
+    """Last-mile: bind category/amount/route on add-appends from user text."""
+    if not isinstance(turn, dict):
+        return turn
+    intent = str(turn.get("intent") or "").lower()
+    if intent not in ("add", ""):
+        return turn
+    raw = (message or "").strip()
+    if not raw:
+        return turn
+    patches = list(turn.get("item_patches") or [])
+    if not patches:
+        rules = extract_expense_single_item_rules(raw)
+        if rules:
+            return {**turn, "intent": "add", "item_patches": rules}
+        return turn
+    enriched = enrich_append_patches_from_message(raw, patches)
+    if len(enriched) == 1 and not _patch_body(enriched[0]).get("category"):
+        rules = extract_expense_single_item_rules(raw)
+        if rules and rules[0].get("category"):
+            enriched = rules
+    out_patches: list[dict[str, Any]] = []
+    for raw_patch in enriched:
+        if not isinstance(raw_patch, dict):
+            continue
+        patch = dict(raw_patch)
+        patch["action"] = "append"
+        patch.pop("item_index", None)
+        patch.pop("match_amount", None)
+        patch.pop("match_last", None)
+        out_patches.append(patch)
+    if not out_patches:
+        return turn
+    return {**turn, "intent": "add", "item_patches": out_patches}
 
 
 def _try_wizard_fallback_turn(
@@ -1950,7 +2351,7 @@ def _attempt_wizard_expense_turn(
     wizard = _try_wizard_fallback_turn(message, memory, trace_id=trace_id)
     if not wizard or not _turn_has_actionable_patches(wizard):
         return None
-    wizard = coerce_expense_correction_turn(wizard, memory)
+    wizard = ensure_expense_turn_item_patches(wizard, message)
     if llm_degraded:
         wizard = {**wizard, "llm_degraded": True}
     if message_requests_submit_after_edit(
@@ -2068,7 +2469,7 @@ def _expense_rules_fallback_turn(
                     turn["llm_degraded"] = True
                 return _log_and_return_expense_turn(trace_id, raw, turn, llm_used=False)
 
-    if is_expense_draft_mutation_message(message, memory):
+    if is_expense_draft_mutation_message(message, memory, trace_id=trace_id):
         regret_turn = normalize_expense_mutation_turn(
             {"intent": "conversation", "item_patches": []},
             message,
@@ -2088,10 +2489,24 @@ def _expense_rules_fallback_turn(
             delete_turn["llm_degraded"] = True
         return _log_and_return_expense_turn(trace_id, raw, delete_turn, llm_used=False)
 
-    if is_expense_draft_mutation_message(message, memory) and not message_has_new_expense_items(raw):
+    modify_turn = coerce_expense_modify_turn(message, memory, trace_id=trace_id)
+    if modify_turn and (
+        modify_turn.get("item_patches")
+        or str(modify_turn.get("intent") or "").startswith("clarify_")
+    ):
+        if llm_degraded:
+            modify_turn["llm_degraded"] = True
+        return _log_and_return_expense_turn(
+            trace_id,
+            raw,
+            modify_turn,
+            llm_used=bool(_llm_client_configured()),
+        )
+
+    if is_expense_draft_mutation_message(message, memory, trace_id=trace_id) and not message_has_new_expense_items(raw):
         return _llm_unavailable_turn()
 
-    coerced = coerce_pending_expense_turn(message, memory)
+    coerced = coerce_pending_expense_turn(message, memory, trace_id=trace_id)
     if coerced:
         if llm_degraded:
             coerced["llm_degraded"] = True
@@ -2169,7 +2584,20 @@ def interpret_expense_draft_turn(
             llm_used=False,
         )
 
-    if not is_expense_pending_field_value_answer(raw, memory):
+    if memory:
+        if pending_expense_edit_active(memory):
+            resolved = resolve_pending_expense_edit_turn(message, memory)
+            if resolved:
+                return _log_and_return_expense_turn(
+                    trace_id, raw, resolved, llm_used=False
+                )
+        coerced_del = coerce_expense_delete_turn(message, memory)
+        if coerced_del:
+            return _log_and_return_expense_turn(
+                trace_id, raw, coerced_del, llm_used=False
+            )
+
+    if not is_expense_pending_field_value_answer(raw, memory, trace_id=trace_id):
         from chat.services.platform.hr_assistant_scope import resolve_hr_assistant_scope
 
         scope_oos = resolve_hr_assistant_scope(
@@ -2222,7 +2650,7 @@ def interpret_expense_draft_turn(
         if is_process_question(raw):
             return {"intent": "conversation", "item_patches": [], "llm_used": False}
 
-    if is_expense_draft_mutation_message(message, memory):
+    if is_expense_draft_mutation_message(message, memory, trace_id=trace_id):
         regret_turn = normalize_expense_mutation_turn(
             {"intent": "conversation", "item_patches": []},
             message,
@@ -2233,11 +2661,31 @@ def interpret_expense_draft_turn(
         ):
             return _log_and_return_expense_turn(trace_id, raw, regret_turn, llm_used=False)
 
-    coerced_pending = coerce_pending_expense_turn(message, memory)
+    if (
+        memory
+        and not message_has_new_expense_items(raw)
+        and (
+            is_expense_draft_mutation_message(message, memory, trace_id=trace_id)
+            or pending_slot_overridden_by_numbered_modify(message, memory, trace_id=trace_id)
+        )
+    ):
+        modify_turn = coerce_expense_modify_turn(message, memory, trace_id=trace_id)
+        if modify_turn and (
+            modify_turn.get("item_patches")
+            or str(modify_turn.get("intent") or "").startswith("clarify_")
+        ):
+            return _log_and_return_expense_turn(
+                trace_id,
+                raw,
+                modify_turn,
+                llm_used=bool(_llm_client_configured()),
+            )
+
+    coerced_pending = coerce_pending_expense_turn(message, memory, trace_id=trace_id)
     if coerced_pending:
         return _log_and_return_expense_turn(trace_id, raw, coerced_pending, llm_used=False)
 
-    if _should_compound_add_over_mutation(None, message, memory):
+    if _should_compound_add_over_mutation(None, message, memory) and not fresh_claim:
         wizard_logged = _attempt_wizard_expense_turn(
             message, memory, trace_id, raw, llm_degraded=False
         )
@@ -2253,12 +2701,14 @@ def interpret_expense_draft_turn(
             or is_compound_expense_message(raw)
             or is_expense_message(raw)
         )
-        if has_expense_body:
+        if has_expense_body and not fresh_claim:
             wizard_logged = _attempt_wizard_expense_turn(
                 message, memory, trace_id, raw, llm_degraded=False
             )
             if wizard_logged is not None:
                 return wizard_logged
+        elif has_expense_body:
+            pass
         else:
             return _log_and_return_expense_turn(
                 trace_id,
@@ -2681,10 +3131,15 @@ def expense_turn_to_field_updates(
         )
     turn = normalize_expense_mutation_turn(turn, message, memory)
     turn = sanitize_expense_llm_patches(turn, message, memory)
-    if str(turn.get("intent") or "").lower() != "date_not_allowed" and not turn.get(
-        "date_policy_rejected"
-    ):
-        turn = finalize_expense_turn_patches(turn, message, memory, trace_id=trace_id)
+    intent = str(turn.get("intent") or "").lower()
+    if intent == "clarify_delete" and not turn.get("item_patches") and not turn.get("delete_indices"):
+        return turn, []
+    if intent == "clarify_modify" and not turn.get("item_patches"):
+        return turn, []
+    if intent != "delete" and not turn.get("delete_indices"):
+        if intent not in ("date_not_allowed",) and not turn.get("date_policy_rejected"):
+            turn = finalize_expense_turn_patches(turn, message, memory, trace_id=trace_id)
+        turn = ensure_expense_turn_item_patches(turn, message)
     date_rejected = False
     if expense_turn_is_new_add(turn, message):
         turn, date_rejected = coerce_expense_date_policy(
@@ -2707,7 +3162,10 @@ def expense_turn_to_field_updates(
         return turn, []
 
     draft = memory.active_draft()
-    if draft and draft.workflow_id == "expense":
+    _, working = resolve_expense_working_draft(memory)
+    if working:
+        fields = dict(working.fields or {})
+    elif draft and draft.workflow_id == "expense":
         fields = dict(draft.fields or {})
     else:
         fields = {"items": []}
@@ -3944,6 +4402,71 @@ def filter_expense_updates_for_review(
     )
 
 
+def expense_understanding_patch_from_applied_deletes(
+    memory,
+    applied_updates,
+    *,
+    source: str = "rules",
+) -> dict[str, Any]:
+    """Overwrite stale expense_turn / turn_understanding after successful line deletes."""
+    from chat.services.platform.schemas import FieldUpdate, TargetRef, UnderstandingAction, UnderstandingResult
+
+    deleted = sorted(
+        {
+            int(u.item_index)
+            for u in (applied_updates or [])
+            if getattr(u, "field", None) == "items"
+            and str(getattr(u, "action", "") or "").lower() == "delete"
+            and u.item_index is not None
+        }
+    )
+    if not deleted:
+        return {}
+    expense_turn = {
+        "intent": "delete",
+        "item_patches": [{"action": "delete", "item_index": i} for i in deleted],
+        "delete_indices": deleted,
+    }
+    entities = expense_entities_for_turn(
+        dict(memory.last_entities or {}),
+        expense_turn,
+        expense_intent="delete",
+        action=UnderstandingAction.DELETE.value,
+    )
+    field_updates = [
+        FieldUpdate(field="items", value=None, item_index=i, action="delete") for i in deleted
+    ]
+    turn_understanding = UnderstandingResult(
+        goal="Update expense draft",
+        workflow="expense",
+        action=UnderstandingAction.DELETE.value,
+        confidence=0.9,
+        entities=entities,
+        field_updates=field_updates,
+        targets=[TargetRef(field="items", item_index=i) for i in deleted],
+        reasoning="Expense delete applied.",
+        source=source,
+    ).to_dict()
+    return {
+        **entities,
+        "turn_understanding": turn_understanding,
+        "expense_wizard_fallback": False,
+        "expense_domain_llm": False,
+    }
+
+
+def refresh_expense_pending_question_after_draft_change(
+    memory,
+    *,
+    lang: str = "en",
+) -> PendingQuestion | None:
+    """Rebuild pending question from the current draft — never adjust stale item_index."""
+    draft = memory.active_draft() if memory else None
+    if draft and draft.workflow_id == "expense":
+        sync_expense_draft(draft)
+    return next_pending_question(memory, lang=lang)
+
+
 def expense_pending_interrupted_by_updates(updates, memory) -> bool:
     """True when applied item ops target a line other than the open pending slot."""
     pq = memory.pending_question if memory else None
@@ -4043,26 +4566,141 @@ def normalize_pending_edit_turn(
     return turn
 
 
+def _draft_expense_item_count(draft: WorkflowDraft | None) -> int:
+    if not draft:
+        return 0
+    return len(list((getattr(draft, "fields", None) or {}).get("items") or []))
+
+
 def _expense_draft_has_items(draft: WorkflowDraft | None) -> bool:
     if not draft or getattr(draft, "workflow_id", None) != "expense":
         return False
-    return bool(list((getattr(draft, "fields", None) or {}).get("items") or []))
+    return _draft_expense_item_count(draft) > 0
+
+
+def resolve_expense_working_draft(
+    memory: SessionMemory | None,
+) -> tuple[str | None, WorkflowDraft | None]:
+    """Single SSOT — which draft holds the in-progress expense claim."""
+    if not memory:
+        return None, None
+    drafts = memory.workflow_drafts or {}
+    aw = memory.active_workflow
+    pq = memory.pending_question
+
+    def _open_expense(draft: WorkflowDraft | None) -> bool:
+        if not draft or getattr(draft, "workflow_id", None) != "expense":
+            return False
+        if draft.locked or str(draft.status or "").lower() == "submitted":
+            return False
+        return True
+
+    if aw and aw.id == "expense":
+        did = str(aw.draft_id or "expense")
+        draft = drafts.get(did)
+        if _open_expense(draft) and (
+            _draft_expense_item_count(draft) > 0 or (pq and pq.workflow_id == "expense")
+        ):
+            return did, draft
+
+    for sw in memory.suspended_workflows or []:
+        wf = sw.workflow_id if hasattr(sw, "workflow_id") else str(sw.get("workflow_id") or "")
+        if str(wf).strip().lower() != "expense":
+            continue
+        did = str(sw.draft_id if hasattr(sw, "draft_id") else sw.get("draft_id") or "expense")
+        draft = drafts.get(did)
+        if _open_expense(draft) and _draft_expense_item_count(draft) > 0:
+            return did, draft
+
+    best: tuple[str, WorkflowDraft] | None = None
+    for did, draft in drafts.items():
+        if not _open_expense(draft) or _draft_expense_item_count(draft) <= 0:
+            continue
+        if not best or int(getattr(draft, "version", 0) or 0) >= int(
+            getattr(best[1], "version", 0) or 0
+        ):
+            best = (str(did), draft)
+    if best:
+        return best
+
+    # Orphaned expense lines stored on a non-expense draft (legacy pollution).
+    for did, draft in drafts.items():
+        if not draft or getattr(draft, "workflow_id", None) == "expense":
+            continue
+        if _draft_expense_item_count(draft) > 0:
+            return str(did), draft
+
+    if aw and aw.id == "expense":
+        did = str(aw.draft_id or "expense")
+        draft = drafts.get(did)
+        if _open_expense(draft):
+            return did, draft
+
+    for did in ("expense",):
+        draft = drafts.get(did)
+        if _open_expense(draft):
+            return did, draft
+    return None, None
+
+
+def iter_open_expense_drafts(memory: SessionMemory | None) -> list[tuple[str, WorkflowDraft]]:
+    """All open expense drafts with line items — for summaries and review."""
+    if not memory:
+        return []
+    primary_id, primary = resolve_expense_working_draft(memory)
+    seen: set[str] = set()
+    out: list[tuple[str, WorkflowDraft]] = []
+    if primary_id and primary and _draft_expense_item_count(primary) > 0:
+        out.append((primary_id, primary))
+        seen.add(primary_id)
+    for did, draft in (memory.workflow_drafts or {}).items():
+        key = str(did)
+        if key in seen or not draft:
+            continue
+        if getattr(draft, "workflow_id", None) != "expense":
+            continue
+        if draft.locked or str(draft.status or "").lower() == "submitted":
+            continue
+        if _draft_expense_item_count(draft) > 0:
+            out.append((key, draft))
+            seen.add(key)
+    return out
 
 
 def memory_has_expense_draft(memory: SessionMemory | None) -> bool:
-    """True when session holds expense line items in an active or suspended draft."""
+    """True when session holds expense line items in any open draft."""
+    if not memory:
+        return False
+    if iter_open_expense_drafts(memory):
+        return True
+    _, draft = resolve_expense_working_draft(memory)
+    if draft and _draft_expense_item_count(draft) > 0:
+        return True
+    aw = memory.active_workflow
+    pq = memory.pending_question
+    if aw and aw.id == "expense" and pq and pq.workflow_id == "expense":
+        return True
+    return False
+
+
+def expense_has_cancellable_draft(memory: SessionMemory | None) -> bool:
+    """True when an open (non-submitted) expense draft exists and can be cancelled."""
     if not memory:
         return False
     aw = memory.active_workflow
-    if aw and aw.id == "expense" and _expense_draft_has_items(memory.active_draft()):
+    if aw and aw.id == "expense":
+        draft = memory.active_draft()
+        if draft and not draft.locked and str(draft.status or "").lower() != "submitted":
+            return True
+    for draft in (memory.workflow_drafts or {}).values():
+        if not draft or getattr(draft, "workflow_id", None) != "expense":
+            continue
+        if draft.locked or str(draft.status or "").lower() == "submitted":
+            continue
         return True
     for sw in memory.suspended_workflows or []:
-        if isinstance(sw, dict) and str(sw.get("workflow_id") or "").strip().lower() == "expense":
-            did = str(sw.get("draft_id") or "expense")
-            if _expense_draft_has_items((memory.workflow_drafts or {}).get(did)):
-                return True
-    for draft_id in ("expense", "default"):
-        if _expense_draft_has_items((memory.workflow_drafts or {}).get(draft_id)):
+        wf = sw.workflow_id if hasattr(sw, "workflow_id") else str(sw.get("workflow_id") or "")
+        if str(wf).strip().lower() == "expense":
             return True
     return False
 
@@ -4183,18 +4821,21 @@ def resolve_pending_expense_edit_turn(message: str, memory) -> dict[str, Any] | 
         return None
 
     clarify = dict(pending.get("clarify") or {})
-    candidates = [
-        int(i)
-        for i in (clarify.get("candidate_indices") or [])
-        if isinstance(i, (int, float)) or str(i).isdigit()
-    ]
-    candidate_arg = candidates if candidates else None
-
-    indices = parse_multiple_item_indices(
-        raw,
-        item_count=len(items),
-        candidate_indices=candidate_arg,
-    )
+    display_list = list(clarify.get("display_list") or [])
+    if kind == "delete" and display_list:
+        indices = resolve_delete_indices_from_display_list(raw, display_list, items)
+    else:
+        candidates = [
+            int(i)
+            for i in (clarify.get("candidate_indices") or [])
+            if isinstance(i, (int, float)) or str(i).isdigit()
+        ]
+        candidate_arg = candidates if candidates else None
+        indices = parse_multiple_item_indices(
+            raw,
+            item_count=len(items),
+            candidate_indices=candidate_arg,
+        )
     idx: int | None = indices[0] if len(indices) == 1 else None
     if idx is None and not indices:
         idx = _numbered_item_index(raw, item_count=len(items))
@@ -4264,6 +4905,64 @@ def resolve_pending_expense_edit_turn(message: str, memory) -> dict[str, Any] | 
     return {"intent": "modify_review", "item_patches": [patch]}
 
 
+def build_expense_delete_display_list(
+    items: list[dict],
+    candidate_indices: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Frozen numbered list shown during clarify_delete — maps UI n → item_id."""
+    if not items:
+        return []
+    if candidate_indices:
+        indices = [
+            int(i)
+            for i in candidate_indices
+            if isinstance(i, (int, float)) or str(i).isdigit()
+        ]
+        indices = [i for i in indices if 0 <= i < len(items)]
+    else:
+        indices = list(range(len(items)))
+    if not indices:
+        indices = list(range(len(items)))
+    display: list[dict[str, Any]] = []
+    for pos, idx in enumerate(indices):
+        item = items[idx]
+        display.append(
+            {
+                "n": pos + 1,
+                "item_index": idx,
+                "item_id": str(item.get("id") or ""),
+            }
+        )
+    return display
+
+
+def resolve_delete_indices_from_display_list(
+    message: str,
+    display_list: list[dict],
+    items: list[dict],
+) -> list[int]:
+    """Map clarify list numbers (1, 2, 5…) to current draft indices via item_id."""
+    if not display_list or not items:
+        return []
+    nums = [int(n) for n in re.findall(r"\b(\d+)\b", (message or "").strip().lower())]
+    if not nums:
+        return []
+    id_by_n = {
+        int(entry["n"]): str(entry.get("item_id") or "")
+        for entry in display_list
+        if entry.get("n") is not None
+    }
+    target_ids = {id_by_n[n] for n in nums if n in id_by_n and id_by_n[n]}
+    if not target_ids:
+        return []
+    indices = [
+        i
+        for i, item in enumerate(items)
+        if str(item.get("id") or "") in target_ids
+    ]
+    return sorted(set(indices))
+
+
 def build_expense_pending_edit_from_turn(
     turn: dict[str, Any],
     *,
@@ -4288,7 +4987,18 @@ def build_expense_pending_edit_from_turn(
         "message": stored_msg,
     }
     if clarify:
-        payload["clarify"] = dict(clarify)
+        clarify = dict(clarify)
+        if intent == "clarify_delete" and memory:
+            draft = memory.active_draft()
+            item_rows = list((draft.fields.get("items") or []) if draft else [])
+            raw_candidates = list(clarify.get("candidate_indices") or [])
+            if not raw_candidates and item_rows:
+                raw_candidates = list(range(len(item_rows)))
+            clarify["display_list"] = build_expense_delete_display_list(
+                item_rows,
+                raw_candidates or None,
+            )
+        payload["clarify"] = clarify
     return payload
 
 
@@ -4452,7 +5162,7 @@ def next_pending_question(
     *,
     lang: str = "en",
 ) -> PendingQuestion | None:
-    draft = memory.active_draft()
+    _, draft = resolve_expense_working_draft(memory)
     if not draft:
         return None
     fields = sync_expense_draft_fields(dict(draft.fields or {}))

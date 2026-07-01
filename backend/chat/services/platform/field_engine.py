@@ -511,7 +511,7 @@ class FieldEngine:
                 continue
             if key == "reason" or not combined.get(key):
                 combined[key] = val
-        merged = merge_leave_field_dicts({}, combined, message, memory=memory)
+        merged = merge_leave_field_dicts({}, combined, message, memory=memory, trace_id=trace_id)
         if merged.get("reason") and (
             is_garbage_leave_reason_value(str(merged["reason"]))
             or is_temporal_or_request_like_leave_reason(str(merged["reason"]))

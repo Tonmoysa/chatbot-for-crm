@@ -141,25 +141,85 @@ def format_expense_summary(
     return "\n".join(lines)
 
 
+_EXPENSE_SUMMARY_SCOPE_CACHE: dict[str, str] = {}
+
+
+def clear_expense_summary_scope_cache(trace_id: str = "") -> None:
+    key = (trace_id or "").strip()
+    if not key:
+        _EXPENSE_SUMMARY_SCOPE_CACHE.clear()
+        return
+    _EXPENSE_SUMMARY_SCOPE_CACHE.pop(key, None)
+
+
+def resolve_expense_summary_scope(
+    message: str,
+    memory: SessionMemory | None,
+    *,
+    trace_id: str = "",
+) -> str:
+    """Return all|submitted|pending for which expense slice the user wants to see."""
+    from chat.services.platform.field_extractors.expense import memory_has_expense_draft
+
+    key = (trace_id or "").strip()
+    if key and key in _EXPENSE_SUMMARY_SCOPE_CACHE:
+        return _EXPENSE_SUMMARY_SCOPE_CACHE[key]
+
+    submitted = list((getattr(memory, "conversation_facts", None) or {}).get("submitted_expenses") or [])
+    has_pending = memory_has_expense_draft(memory)
+    scope = "all"
+    try:
+        import json
+
+        from chat.services.llm_client import LLMClient
+        from chat.services.platform.llm_prompts import EXPENSE_SUMMARY_SCOPE_SYSTEM
+
+        parsed = LLMClient().chat_json(
+            system_prompt=EXPENSE_SUMMARY_SCOPE_SYSTEM,
+            user_prompt=json.dumps(
+                {
+                    "message": (message or "").strip(),
+                    "has_submitted_expenses": bool(submitted),
+                    "has_pending_expense_draft": bool(has_pending),
+                    "submitted_count": len(submitted),
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+            trace_id=trace_id or "",
+            scope="expense-summary-scope",
+        )
+        if isinstance(parsed, dict):
+            raw = str(parsed.get("scope") or "all").strip().lower()
+            if raw in ("all", "submitted", "pending"):
+                scope = raw
+    except Exception:
+        scope = "all"
+
+    if key:
+        _EXPENSE_SUMMARY_SCOPE_CACHE[key] = scope
+    return scope
+
+
 def format_expense_status_report(
     memory: SessionMemory,
     *,
     lang: str = "en",
     focus_draft: WorkflowDraft | None = None,
+    scope: str = "all",
 ) -> str:
     """Submitted + open pending expense drafts — full session expense picture."""
+    scope_key = str(scope or "all").strip().lower()
+    if scope_key not in ("all", "submitted", "pending"):
+        scope_key = "all"
+
     submitted_rows = list((memory.conversation_facts or {}).get("submitted_expenses") or [])
+    from chat.services.platform.field_extractors.expense import iter_open_expense_drafts
+
     open_drafts: list[WorkflowDraft] = []
     seen: set[str] = set()
-    for draft_id, draft in (memory.workflow_drafts or {}).items():
-        if not draft or draft.workflow_id != "expense":
-            continue
-        if draft.locked or draft.status == "submitted":
-            continue
-        items = list((draft.fields or {}).get("items") or [])
-        if not items:
-            continue
-        key = str(draft_id)
+    for _did, draft in iter_open_expense_drafts(memory):
+        key = str(id(draft))
         if key in seen:
             continue
         seen.add(key)
@@ -169,6 +229,21 @@ def format_expense_status_report(
         items = list((focus_draft.fields or {}).get("items") or [])
         if items:
             open_drafts.insert(0, focus_draft)
+
+    if scope_key == "submitted":
+        open_drafts = []
+    elif scope_key == "pending":
+        submitted_rows = []
+
+    if scope_key == "submitted" and not submitted_rows:
+        if lang in ("bn", "banglish"):
+            return "Apnar kono **submit kora expense** nei."
+        return "You have no **submitted expenses** yet."
+
+    if scope_key == "pending" and not open_drafts:
+        if lang in ("bn", "banglish"):
+            return "Apnar kono **pending expense draft** nei — notun expense add korte parben."
+        return "You have no **pending expense draft** — you can start a new expense anytime."
 
     if not submitted_rows and not open_drafts:
         if lang == "bn":

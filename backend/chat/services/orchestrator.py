@@ -55,6 +55,9 @@ class ChatOrchestrator:
         )
         session = bundle.session
         session_memory = bundle.memory
+        from chat.services.session_memory import reduce_reconcile_expense_session
+
+        reduce_reconcile_expense_session(session_memory)
         context_lines = bundle.transcript_lines
 
         turn_context = build_turn_context(

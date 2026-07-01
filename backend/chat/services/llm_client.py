@@ -89,6 +89,12 @@ def clear_llm_trace_state(trace_id: str = "") -> None:
         _RATE_LIMIT_TRIPPED.clear()
         _EXPENSE_LLM_DONE.clear()
         _EXPENSE_TURN_CACHE.clear()
+        try:
+            from chat.services.platform.field_extractors.modify import clear_modify_request_cache
+
+            clear_modify_request_cache()
+        except Exception:
+            pass
         return
     key = trace_id.strip()
     for ck in list(_JSON_HTTP_FAILURES.keys()):
@@ -112,9 +118,21 @@ def clear_llm_trace_state(trace_id: str = "") -> None:
     except Exception:
         pass
     try:
+        from chat.services.platform.summary import clear_expense_summary_scope_cache
+
+        clear_expense_summary_scope_cache(key)
+    except Exception:
+        pass
+    try:
         from chat.services.platform.workflow_cancel import clear_workflow_cancel_cache
 
         clear_workflow_cancel_cache(key)
+    except Exception:
+        pass
+    try:
+        from chat.services.platform.field_extractors.modify import clear_modify_request_cache
+
+        clear_modify_request_cache(key)
     except Exception:
         pass
 

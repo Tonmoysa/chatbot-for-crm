@@ -121,7 +121,10 @@ def intent_priority_decision(
     expense_turn = (understanding.entities or {}).get("expense_turn")
     wf = understanding.workflow or (aw.id if aw else "")
 
-    from chat.services.platform.turn_semantics import is_expense_review_request
+    from chat.services.platform.turn_semantics import (
+        cross_workflow_switch_target,
+        is_expense_review_request,
+    )
 
     cancel_target = str((understanding.entities or {}).get("cancel_workflow_target") or "").lower()
     if not cancel_target:
@@ -226,20 +229,20 @@ def intent_priority_decision(
             reasoning=f"Pending {pq.field} — need a field value, not yes/no.",
         )
 
+    switch_target = cross_workflow_switch_target(understanding, aw.id if aw else None)
     if (
-        understanding.interrupt_workflow
+        switch_target
         and aw
-        and understanding.interrupt_workflow != aw.id
         and conf >= 0.65
         and not is_expense_review_request(message, understanding)
     ):
         return PendingQuestionDecision(
             kind=MessageIntentKind.SWITCH_WORKFLOW,
             confidence=max(conf, 0.85),
-            reasoning=understanding.reasoning or f"Switch to {understanding.interrupt_workflow}.",
+            reasoning=understanding.reasoning or f"Switch to {switch_target}.",
             source=src,
             blocks_new_workflow=True,
-            target_workflow=understanding.interrupt_workflow,
+            target_workflow=switch_target,
             extracted_entities={"interrupts_pending": bool(pq)},
         )
 
@@ -694,6 +697,19 @@ def informational_priority_decision(
             from chat.services.platform.field_extractors.expense import (
                 expense_turn_has_targeted_patches,
             )
+            from chat.services.platform.turn_semantics import cross_workflow_switch_target
+
+            switch_target = cross_workflow_switch_target(understanding, aw.id if aw else None)
+            if switch_target and aw:
+                return PendingQuestionDecision(
+                    kind=MessageIntentKind.SWITCH_WORKFLOW,
+                    confidence=max(understanding.confidence, 0.88),
+                    reasoning=understanding.reasoning or f"Switch to {switch_target}.",
+                    source=understanding.source or "understanding",
+                    blocks_new_workflow=True,
+                    target_workflow=switch_target,
+                    extracted_entities={"interrupts_pending": bool(pq)},
+                )
 
             expense_turn = (understanding.entities or {}).get("expense_turn")
             if (

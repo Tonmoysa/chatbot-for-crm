@@ -35,31 +35,12 @@ def session_has_workflow_context(memory) -> bool:
 
 def session_expense_draft(memory) -> Any | None:
     """Pending or in-progress expense draft — active, suspended, or stored."""
-    from chat.services.platform.field_extractors.expense import _expense_draft_has_items
+    from chat.services.platform.field_extractors.expense import resolve_expense_working_draft
 
     if not memory:
         return None
-
-    aw = memory.active_workflow
-    if aw and aw.id == "expense":
-        draft = (memory.workflow_drafts or {}).get(aw.draft_id)
-        if _expense_draft_has_items(draft):
-            return draft
-
-    for sw in memory.suspended_workflows or []:
-        wf = sw.workflow_id if hasattr(sw, "workflow_id") else str(sw.get("workflow_id") or "")
-        if str(wf).strip().lower() != "expense":
-            continue
-        did = sw.draft_id if hasattr(sw, "draft_id") else str(sw.get("draft_id") or "expense")
-        draft = (memory.workflow_drafts or {}).get(str(did or "expense"))
-        if _expense_draft_has_items(draft):
-            return draft
-
-    for draft_id in ("expense", "default"):
-        draft = (memory.workflow_drafts or {}).get(draft_id)
-        if _expense_draft_has_items(draft):
-            return draft
-    return None
+    _, draft = resolve_expense_working_draft(memory)
+    return draft
 
 
 def session_leave_draft(memory) -> Any | None:

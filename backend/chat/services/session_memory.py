@@ -680,6 +680,100 @@ def reduce_arm_duplicate_leave(memory: SessionMemory, entities: dict[str, Any]) 
     reduce_set_pending_confirmation(memory, "duplicate_leave")
 
 
+def reduce_reconcile_expense_session(memory: SessionMemory) -> bool:
+    """Move orphaned expense items off non-expense drafts; align active workflow + pending PQ."""
+    from chat.services.platform.field_extractors.expense import (
+        next_pending_question,
+        resolve_expense_working_draft,
+        sync_expense_draft_fields,
+    )
+
+    drafts = memory.workflow_drafts or {}
+    changed = False
+    orphaned_items: list[dict[str, Any]] = []
+    orphaned_incurred: str | None = None
+    polluted: list[tuple[str, dict[str, Any]]] = []
+
+    for did, draft in list(drafts.items()):
+        if not draft:
+            continue
+        if getattr(draft, "workflow_id", None) == "expense":
+            continue
+        fields = dict(draft.fields or {})
+        items = [it for it in (fields.get("items") or []) if isinstance(it, dict)]
+        if not items:
+            continue
+        orphaned_items.extend(items)
+        if fields.get("incurred_date") and not orphaned_incurred:
+            orphaned_incurred = str(fields.get("incurred_date"))
+        polluted.append((str(did), fields))
+        changed = True
+
+    if changed:
+        expense_did = "expense"
+        aw = memory.active_workflow
+        if aw and aw.id == "expense":
+            expense_did = str(aw.draft_id or "expense")
+
+        expense_draft = drafts.get(expense_did)
+        if not expense_draft or expense_draft.workflow_id != "expense":
+            expense_draft = WorkflowDraft(workflow_id="expense", fields={"items": []})
+            drafts[expense_did] = expense_draft
+
+        exp_fields = sync_expense_draft_fields(dict(expense_draft.fields or {}))
+        merged = list(exp_fields.get("items") or [])
+        seen_ids = {str(it.get("id")) for it in merged if isinstance(it, dict) and it.get("id")}
+        for item in orphaned_items:
+            iid = str(item.get("id") or "")
+            if iid and iid in seen_ids:
+                continue
+            merged.append(item)
+            if iid:
+                seen_ids.add(iid)
+        exp_fields["items"] = merged
+        if orphaned_incurred and not exp_fields.get("incurred_date"):
+            exp_fields["incurred_date"] = orphaned_incurred
+        expense_draft.fields = sync_expense_draft_fields(exp_fields)
+        expense_draft.line_items = list(merged)
+        expense_draft.version = int(getattr(expense_draft, "version", 0) or 0) + 1
+
+        for did, fields in polluted:
+            polluted_draft = drafts.get(did)
+            if not polluted_draft:
+                continue
+            clean = dict(fields)
+            clean.pop("items", None)
+            clean.pop("incurred_date", None)
+            polluted_draft.fields = clean
+            polluted_draft.line_items = []
+            polluted_draft.version = int(getattr(polluted_draft, "version", 0) or 0) + 1
+
+        if memory.pending_question and memory.pending_question.workflow_id == "expense":
+            reduce_set_active_workflow(
+                memory,
+                ActiveWorkflow(id="expense", stage="collecting", draft_id=expense_did),
+            )
+
+    pq = memory.pending_question
+    if pq and pq.workflow_id == "expense":
+        did, working = resolve_expense_working_draft(memory)
+        if did and working:
+            aw = memory.active_workflow
+            if not aw or aw.id != "expense" or str(aw.draft_id or "") != str(did):
+                reduce_set_active_workflow(
+                    memory,
+                    ActiveWorkflow(id="expense", stage="collecting", draft_id=str(did)),
+                )
+                changed = True
+            if list((working.fields or {}).get("items") or []):
+                refreshed = next_pending_question(memory)
+                if refreshed:
+                    reduce_set_pending_question(memory, refreshed)
+                    changed = True
+
+    return changed
+
+
 def reduce_apply_field_updates(
     memory: SessionMemory,
     draft_id: str,
@@ -697,6 +791,27 @@ def reduce_apply_field_updates(
     updates = deserialize_field_updates(updates_raw)
     if not updates:
         return []
+
+    expense_only_fields = frozenset({"items", "incurred_date"})
+    if draft.workflow_id == "leave" and any(
+        getattr(u, "field", None) in expense_only_fields for u in updates
+    ):
+        reduce_reconcile_expense_session(memory)
+        from chat.services.platform.field_extractors.expense import resolve_expense_working_draft
+
+        target_id, target_draft = resolve_expense_working_draft(memory)
+        if target_id and target_draft and target_draft.workflow_id == "expense":
+            return reduce_apply_field_updates(
+                memory,
+                target_id,
+                updates_raw,
+                message=message,
+                trace_id=trace_id,
+                review_validated=review_validated,
+            )
+        updates = [u for u in updates if getattr(u, "field", None) not in expense_only_fields]
+        if not updates:
+            return []
 
     if draft.workflow_id == "leave":
         from chat.services.platform.field_extractors.leave import (
@@ -768,7 +883,7 @@ def reduce_apply_field_updates(
     if draft.workflow_id == "leave":
         from chat.services.platform.field_extractors.leave import apply_leave_derived_fields
 
-        apply_leave_derived_fields(draft, message=message or "")
+        apply_leave_derived_fields(draft, message=message or "", trace_id=trace_id)
 
     after_fields = dict(draft.fields or {})
     applied = [

@@ -81,6 +81,10 @@ DATES (LLM is sole interpreter — no regex downstream)
 - Review edits: user may change ONLY start, ONLY end, or both — partial patches only.
 - "3 july koro", "end date 7 july hobe", "shesh tarikh 9 august" → correct ISO for the intended field(s).
 - Weekday spans: "next wednesday theke friday" → start_date + end_date.
+- Duration phrases (N din/days): inclusive span — "kal theke 3 diner jonno" → start_date + end_date where end = start + (N-1) calendar days.
+- Single calendar day with no duration phrase → start_date only (system mirrors end_date = start_date).
+- Multi-day leave (span >= 2 days): always set day_scope=full_day in field_updates — never leave day_scope empty for multi-day.
+- Only single-day leave without explicit half-day wording should leave day_scope empty (bot asks full/half).
 - Never invent dates the user did not imply.
 
 ENTITIES
@@ -108,6 +112,8 @@ FEW-SHOT
 10) "ami osusto, kalke theke" with missing dates → collect/start, leave_type=sick, start_date=tomorrow, reason=unwell
 11) "baba-r operation... hospital e thakte hobe... Sick Leave hisebe... Monday-Thursday" → start/collect, reason=Father's operation; hospital stay, leave_type EMPTY (NOT sick), dates filled, day_scope=full_day
 12) "14 Sep to 17 Sep annual leave" (multi-day) → day_scope=full_day in same pass, do not leave day_scope empty
+13) "ami osusto, kal theke 3 diner jonno chuti" → start_date=tomorrow, end_date=tomorrow+2 days, leave_type=sick, reason=unwell, day_scope=full_day
+14) "amar leave lagbe kalke" → start_date=tomorrow only (single day; no day_scope unless user says full/half)
 
 COLLECT STAGE (pending_question set, not review)
 - Short reply usually answers the pending field — set answers_pending_field=true.
@@ -275,6 +281,11 @@ RULES
   NEVER use "leave tomorrow", "amar leave lagbe kalke", kalke/kal/agamikal, or date ranges as reason.
   NEVER use "office attend korte parbo na" / unavailability boilerplate as reason.
 - Extract ALL clearly stated fields in one pass.
+- Duration (N din/days/week): inclusive calendar span — set start_date AND end_date (end = start + N-1 days).
+  "kal theke 3 diner jonno" → start=tomorrow, end=tomorrow+2. "5 din er chuti" with start → end=start+4.
+- Single day with no duration phrase → start_date only (end_date omitted; system defaults end=start).
+- Multi-day span (2+ days) → always include day_scope=full_day.
+- Single-day only → omit day_scope unless user says full day / half day / ordho din.
 
 FEW-SHOT
 1) "dadi osustho, family gram e jacche, 14 Sep-17 Sep annual leave" →
@@ -284,6 +295,31 @@ FEW-SHOT
 4) "amar leave lagbe kalke" → start_date=<tomorrow ISO> only — NO reason field
 5) "kal theke chuti lagbe" / "leave tomorrow" → start_date only — NO reason
 6) "porshu tar leave lagbe" → start_date=<today+2 ISO> only — NO reason; must NOT reuse submitted_leave_ranges dates
+7) "ami osusto, kal theke 3 diner jonno" → start_date=<tomorrow>, end_date=<tomorrow+2>, leave_type=sick, reason=unwell, day_scope=full_day
+8) "kalke chuti" → start_date=<tomorrow> only — single day, no day_scope
+"""
+
+LEAVE_END_DATE_INFER_SYSTEM = """Infer leave end_date from the user message when duration or a date range is stated.
+Return ONLY valid JSON:
+{
+  "end_date": "YYYY-MM-DD or null",
+  "duration_days": number or null,
+  "reasoning": "one short sentence — internal only"
+}
+
+RULES
+- Use start_date and today_iso from payload. The span is inclusive (3 days from Monday → Mon–Wed).
+- duration_days: count calendar days the user wants (3 din, tin diner jonno, 3 days, for 3 days).
+- When duration_days is set: end_date = start_date + (duration_days - 1) calendar days.
+- Explicit date range in message → end_date is the last day of the range.
+- Single day only (kalke chuti, tomorrow leave) with NO multi-day duration → return null for both fields.
+- If message does not state duration or an end date, return null — do not guess.
+
+FEW-SHOT (start_date=2026-06-29, today_iso=2026-06-28)
+1) "kal theke 3 diner jonno" with start 2026-06-29 → {"duration_days":3,"end_date":"2026-07-01"}
+2) "14 sep theke 17 sep" → {"end_date":"2026-09-17"}
+3) "amar leave lagbe kalke" → {"end_date":null,"duration_days":null}
+4) "5 din er sick leave" with start 2026-08-01 → {"duration_days":5,"end_date":"2026-08-05"}
 """
 
 LEAVE_REASON_EXTRACT_SYSTEM = """Extract ONLY the leave reason from the user message.
@@ -466,6 +502,34 @@ FEW-SHOT
 - "kalke lunch 100 bus 120 mirpur to badda" → lunch 100, bus 120 with route
 """
 
+EXPENSE_FRESH_DRAFT_INTENT_SYSTEM = """Decide if user wants to DISCARD the current pending expense draft and start completely fresh.
+Return ONLY valid JSON:
+{
+  "fresh_draft": true|false,
+  "confidence": 0.0-1.0,
+  "reasoning": ""
+}
+
+fresh_draft=true ONLY when user explicitly asks to:
+- cancel/clear/discard/reset the current pending expense draft and start over
+- "agrer expense cancel koro", "purono draft clear koro", "notun expense shuru koro" (start over — not listing items)
+- "clear draft", "fresh expense", "reset expense"
+
+fresh_draft=false when:
+- User lists expense line items with amounts (lunch 100, bus 30, etc.) — merge into existing draft
+- User answers a pending question (route, category, amount)
+- User wants to add more items to the existing draft
+- User asks for summary, submit, or modify a specific line
+- Ambiguous — prefer false (merge) when items with amounts are present
+
+FEW-SHOT:
+- pending draft exists, "100 lunch, 30 bus" → fresh_draft=false (merge)
+- "agrer expense cancel kore notun shuru koro" → fresh_draft=true
+- "clear draft lunch 100" → fresh_draft=true (clear then user may add — still fresh)
+- "notun expense shuru koro" with no amounts → fresh_draft=true
+- "notun expense lunch 100" → fresh_draft=false (adding with notun phrasing but has items)
+"""
+
 EXPENSE_SLOT_FROM_HISTORY_SYSTEM = """Extract ONE expense slot value from a prior user message.
 Return ONLY valid JSON:
 {
@@ -504,8 +568,9 @@ Return ONLY valid JSON:
 RULES
 - Read last_assistant_message, pending_confirmation, active_workflow, suspended_workflows, conversation_history, and the latest user message together.
 - pending_confirmation like switch:leave:expense + yes/ha/ok/thik → confirm_switch target expense; no/na → decline_switch (stay on leave).
+- pending_confirmation=submit + last_assistant_message asked expense claim → confirm_expense_start (NOT confirm_leave_submit).
+- pending_confirmation=submit + last_assistant_message showed leave review/submit → confirm_leave_submit.
 - Bot asked "Expense claim toiri korbo?" / "create expense claim" and user says yes/ha/ok → confirm_expense_start (even if active workflow is still leave).
-- Bot showed leave submit review ("Reply yes to submit") and user says yes/ha → confirm_leave_submit.
 - User says no/naki after submit review → decline_leave_submit.
 - "expense e fire jao" / "leave e back" with suspended workflow → resume_suspended with matching target_workflow.
 - Company policy / HR policy questions → policy_query.
@@ -603,6 +668,29 @@ FEW-SHOT:
 - last_assistant showed leave summary, user: "cancel it" → is_cancel=true, target_workflow=leave
 - suspended leave+expense, last bot showed leave summary, "cancel it" → leave
 - "leave er summery ta daw" → is_cancel=false
+- no active draft, submitted expense exists, "cancel the expense" → is_cancel=true, target_workflow=expense (no draft to cancel — not a new claim)
+"""
+
+EXPENSE_SUMMARY_SCOPE_SYSTEM = """Expense summary scope — return ONLY JSON:
+{
+  "scope": "all|submitted|pending",
+  "reasoning": ""
+}
+
+User wants to SEE expense information (summary/list/status). Decide which slice to show:
+
+scope:
+- all: generic expense summary with no specific submitted/pending qualifier — show everything available
+- submitted: user asks specifically for already-submitted / filed / completed claims (submit hoyeche, jeta submit korechi, submitted expense, filed claim)
+- pending: user asks specifically for draft / not-yet-submitted / current open expense (pending, draft, ekhono submit hoyni, current expense list)
+
+FEW-SHOT:
+- "expense summery daw" / "expense list dekhao" → all
+- "amake expense er sumery ta daw jeta submit hoyeche" → submitted
+- "submit kora expense dekhao" → submitted
+- "pending expense ta dekhao" / "draft expense list" → pending
+- "amar current expense" / "jeita submit hoyni" → pending
+- has_submitted=true, has_pending=true, "expense summary" → all
 """
 
 EXPENSE_DELETE_INDICES_SYSTEM = """Expense delete index resolver — return ONLY JSON:
@@ -640,9 +728,12 @@ RULES
 - Interpret Banglish freely: "vule 100 diyechi ota 150 hobe", "amount ta change koro", "1 number bus 130 taka".
 - Category references: lunch, snack, bus, train, bike, metro, rickshaw — match against items[].
 - Positional refs: "prothom/first" → first matching item; "sesh/last" → last matching item.
-- Numbered refs: "1 no", "expense 2", "3 number" → line number minus 1 as item_index.
-- Amount: use the NEW/correct amount — never confuse entry number with taka amount.
-- Route-only edits: fill from_location + to_location, amount null unless user also changes amount.
+- Numbered refs: "1 no", "expense 2", "3 number", "5 number expense" → line number minus 1 as item_index.
+- When user names a specific expense number, item_index = that line minus 1 — even if another line has an open pending slot question.
+- Amount: use the NEW/correct amount from the user message — never confuse entry number with taka amount.
+- Route-only edits: fill from_location + to_location from the USER MESSAGE ONLY (e.g. "A to B", "A theke B hobe", "route hobe A to B") — NEVER copy the existing route from items[] unless the user did not mention any places.
+- office, badda/baada/bada, gulshan/golshan, mirpur, uttora are valid commute endpoints (office may be from or to).
+- Category-only edits: "N number er category X hobe" → item_index N-1, category X, amount null.
 - Multiple items match same category → needs_clarify=true, candidate_indices=[...], proposed amount in amount field.
 - Not a modify request → return {"needs_clarify": false, "item_index": null, "amount": null}.
 
@@ -651,6 +742,11 @@ FEW-SHOT
 - items: 2 buses, "bus 130 taka hobe" → needs_clarify true, candidate_indices both bus indices, amount 130
 - items: [{cat:bus,amt:45}], "45 er jaygay 35 hobe" → item_index 0, amount 35, match_amount 45
 - "expense 2 130 taka" with 3 items → item_index 1, amount 130
+- items: 5 lines, user: "2 number expense er route mirpur to gulshan hobe" → item_index 1 (expense 2), from_location mirpur, to_location gulshan, amount null
+- items: [{cat:bus,route:mirpur→golshan}], "3 no er route uttora theke mirpur hobe" → item_index 2, from_location uttora, to_location mirpur
+- items: 5 lines, expense 5 bus gulshan→office, user: "5 number expense er route hobe office to badda" → item_index 4, from_location office, to_location badda, amount null
+- items: 4 lines, pending slot on expense 2 route, user: "4 number expense er route hobe office to badda" → item_index 3 (expense 4), NOT expense 2
+- items: 4 lines, user: "3 number er category metro hobe" → item_index 2, category metro, amount null
 """
 
 HR_ASSISTANT_SCOPE_SYSTEM = """You decide whether a user message belongs in a workplace HR assistant (leave, expense, company policy, greetings, workflow control).

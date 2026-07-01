@@ -184,6 +184,23 @@ def _looks_like_slot_answer(message: str, *, field: str, workflow_id: str) -> bo
     return True
 
 
+def cross_workflow_switch_target(
+    understanding: UnderstandingResult | None,
+    active_workflow_id: str | None,
+) -> str | None:
+    """Return leave|expense when understanding points at a different workflow than active."""
+    active = (active_workflow_id or "").strip().lower()
+    if not active or not understanding:
+        return None
+    interrupt = (understanding.interrupt_workflow or "").strip().lower()
+    if interrupt in ("leave", "expense") and interrupt != active:
+        return interrupt
+    target = (understanding.workflow or "").strip().lower()
+    if target in ("leave", "expense") and target != active:
+        return target
+    return None
+
+
 def enrich_answers_pending_field(
     message: str,
     memory: SessionMemory,
@@ -311,6 +328,21 @@ def enrich_answers_pending_field(
             result.action = UnderstandingAction.COLLECT.value
             result.workflow = "expense"
             return result
+        if expense_intent in ("clarify_modify", "clarify_delete"):
+            return result
+        from chat.services.platform.field_extractors.expense import (
+            pending_expense_edit_active,
+            resolve_pending_expense_edit_turn,
+        )
+
+        if pending_expense_edit_active(memory) and resolve_pending_expense_edit_turn(
+            message, memory
+        ):
+            return result
+        if expense_intent == "delete" and not result.field_updates:
+            expense_turn = dict((result.entities or {}).get("expense_turn") or {})
+            if expense_turn.get("delete_indices") or expense_turn.get("item_patches"):
+                return result
         if not result.field_updates and expense_intent not in (
             "date_correction",
             "replay_blocked_add",

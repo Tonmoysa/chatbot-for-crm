@@ -1470,6 +1470,57 @@ class ResponseComposer:
             msg += f"\n\nReference: **`{request_id}`**"
         return msg
 
+    def expense_no_draft_to_cancel(self, *, lang: str = "en", request_id: str = "") -> str:
+        ref = f"\n\nSubmitted claim reference: **`{request_id}`**" if request_id else ""
+        return localized(
+            lang,
+            en=(
+                "There is **no active expense draft** to cancel."
+                f"{ref}\n\n"
+                "Submitted expense claims cannot be cancelled from chat. "
+                "To start a **new** expense, share your items (e.g. lunch 100 taka)."
+            ),
+            bn=(
+                "Cancel করার মতো **কোনো active expense draft** নেই।"
+                f"{ref}\n\n"
+                "Submit করা expense claim chat থেকে cancel করা যায় না। "
+                "নতুন expense শুরু করতে খরচের তথ্য দিন (যেমন lunch 100 taka)।"
+            ),
+            banglish=(
+                "Cancel korar moto **kono active expense draft** nei."
+                f"{ref}\n\n"
+                "Submit kora expense claim chat theke cancel kora jay na. "
+                "Notun expense shuru korte kharcha likhun (jemon lunch 100 taka)."
+            ),
+        )
+
+    def expense_submitted_locked(self, request_id: str, *, lang: str = "en") -> str:
+        ref = f"\n\nReference: **`{request_id}`**" if request_id else ""
+        return localized(
+            lang,
+            en=(
+                "This **expense claim** has already been submitted and is locked. "
+                "You cannot cancel, edit, modify, or delete it from chat."
+                f"{ref}\n\n"
+                "There is no pending expense draft to cancel. "
+                "To start a **new** expense claim, share your expenses (e.g. lunch 100 taka)."
+            ),
+            bn=(
+                "এই **expense claim** ইতিমধ্যে submit হয়ে গেছে এবং locked আছে। "
+                "এখান থেকে cancel, edit, modify বা delete করা যাবে না।"
+                f"{ref}\n\n"
+                "Cancel করার মতো কোনো pending expense draft নেই। "
+                "নতুন expense claim শুরু করতে খরচের তথ্য দিন (যেমন lunch 100 taka)।"
+            ),
+            banglish=(
+                "Ei **expense claim** already submit hoye geche — locked ache. "
+                "Ekhane theke cancel, edit, modify ba delete kora jabe na."
+                f"{ref}\n\n"
+                "Cancel korar moto kono pending expense draft nei. "
+                "Notun expense claim korte kharcha likhun (jemon lunch 100 taka)."
+            ),
+        )
+
     def workflow_started(self, workflow_name: str, *, lang: str = "en") -> str:
         return localized(
             lang,
@@ -1600,13 +1651,19 @@ class ResponseComposer:
         lang: str = "en",
         emphasize_total: bool = False,
         memory: SessionMemory | None = None,
+        expense_scope: str = "all",
     ) -> str:
         """Informational summary turn — uses ``format_*_summary``, not ``build_review``."""
         if definition.workflow_id == "expense":
             from chat.services.platform.summary import format_expense_status_report
 
             if memory is not None:
-                msg = format_expense_status_report(memory, lang=lang, focus_draft=draft)
+                msg = format_expense_status_report(
+                    memory,
+                    lang=lang,
+                    focus_draft=draft,
+                    scope=expense_scope,
+                )
             else:
                 msg = format_expense_summary(draft, lang=lang)
             if emphasize_total:
@@ -1699,6 +1756,35 @@ class ResponseComposer:
         return ""
 
     def item_prefix_from_updates(self, updates, *, lang: str = "en") -> str:
+        delete_nums = sorted(
+            {
+                int(upd.item_index) + 1
+                for upd in (updates or [])
+                if upd.field == "items"
+                and upd.action == "delete"
+                and upd.item_index is not None
+            }
+        )
+        if delete_nums:
+            if len(delete_nums) == 1:
+                n = delete_nums[0]
+                return localized(
+                    lang,
+                    en=f"Expense {n} deleted.",
+                    bn=f"Expense {n} মুছে ফেলা হয়েছে।",
+                    banglish=f"Expense {n} delete kora hoyeche.",
+                )
+            if len(delete_nums) == 2:
+                joined = f"{delete_nums[0]} and {delete_nums[1]}"
+            else:
+                joined = ", ".join(str(n) for n in delete_nums[:-1]) + f", and {delete_nums[-1]}"
+            return localized(
+                lang,
+                en=f"Expense {joined} deleted.",
+                bn=f"Expense {joined} মুছে ফেলা হয়েছে।",
+                banglish=f"Expense {joined} delete kora hoyeche.",
+            )
+
         lines: list[str] = []
         for upd in updates or []:
             if upd.field == "items" and isinstance(upd.value, dict) and upd.action == "append":

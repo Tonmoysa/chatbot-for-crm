@@ -187,6 +187,36 @@ class AIUnderstandingLayer:
                     return guarded
 
         if client.is_configured():
+            from chat.services.platform.intent_rules import is_bare_confirmation
+
+            if (
+                is_bare_confirmation(raw)
+                and memory.pending_confirmation == "submit"
+                and not self._should_skip_session_context(raw, memory)
+            ):
+                from chat.services.platform.conversation_context import resolve_session_context_turn
+
+                session_ctx = resolve_session_context_turn(
+                    raw,
+                    memory,
+                    conversation_history,
+                    trace_id=trace_id,
+                )
+                if session_ctx is not None:
+                    session_ctx = self._enrich_session_confirmed_expense(
+                        session_ctx,
+                        raw,
+                        memory,
+                        trace_id=trace_id,
+                        conversation_history=conversation_history,
+                    )
+                    from chat.services.platform.turn_semantics import enrich_answers_pending_field
+
+                    result = enrich_answers_pending_field(message, memory, session_ctx)
+                    guarded = apply_confidence_guard(result)
+                    self._log(trace_id, raw, memory, guarded)
+                    return guarded
+
             domain = self._try_domain_workflow_understanding(
                 raw,
                 memory=memory,
@@ -431,10 +461,12 @@ class AIUnderstandingLayer:
         conversation_history: list[str] | None = None,
         trace_id: str = "",
     ) -> UnderstandingResult | None:
-        from chat.services.platform.workflow_cancel import resolve_workflow_cancel_target
-        from chat.services.platform.workflow_show import session_has_workflow_context
+        from chat.services.platform.workflow_cancel import (
+            _session_supports_cancel_routing,
+            resolve_workflow_cancel_target,
+        )
 
-        if not session_has_workflow_context(memory):
+        if not _session_supports_cancel_routing(memory):
             return None
         active_id = (memory.active_workflow.id if memory.active_workflow else "").strip().lower()
         cancel_wf = resolve_workflow_cancel_target(
@@ -772,12 +804,15 @@ class AIUnderstandingLayer:
                 answers_pending_field=False,
             )
 
+        from chat.services.platform.field_extractors.expense import resolve_expense_fresh_claim
+
         if not fresh_claim:
-            exp_draft = (memory.workflow_drafts or {}).get("expense")
-            if exp_draft and list((exp_draft.fields or {}).get("items") or []):
-                fresh_claim = False
-            else:
-                fresh_claim = (active_id or "").strip().lower() != "expense"
+            fresh_claim = resolve_expense_fresh_claim(
+                message,
+                memory,
+                active_id,
+                trace_id=trace_id,
+            )
         result = self._expense_collect(
             message,
             memory,
@@ -853,6 +888,20 @@ class AIUnderstandingLayer:
             if is_bare_confirmation(raw) or parse_submit_workflow(
                 raw, active_workflow_id="leave"
             ):
+                from chat.services.platform.turn_semantics import last_assistant_message
+
+                last_bot = (last_assistant_message(conversation_history) or "").lower()
+                if any(
+                    marker in last_bot
+                    for marker in (
+                        "expense claim",
+                        "toiri korbo",
+                        "tori korbo",
+                        "expense entry",
+                        "expense claim",
+                    )
+                ):
+                    return None
                 return UnderstandingResult(
                     goal="Confirm submit",
                     workflow="leave",
@@ -2421,15 +2470,17 @@ class AIUnderstandingLayer:
             filter_expense_updates_for_review,
             is_expense_review_mode,
             patches_to_field_updates,
+            resolve_expense_fresh_claim,
             _turn_has_actionable_patches,
         )
 
         if not fresh_claim:
-            exp_draft = (memory.workflow_drafts or {}).get("expense")
-            if exp_draft and list((exp_draft.fields or {}).get("items") or []):
-                fresh_claim = False
-            else:
-                fresh_claim = (active_id or "").strip().lower() != "expense"
+            fresh_claim = resolve_expense_fresh_claim(
+                message,
+                memory,
+                active_id,
+                trace_id=trace_id,
+            )
 
         turn, updates = expense_turn_to_field_updates(
             message,

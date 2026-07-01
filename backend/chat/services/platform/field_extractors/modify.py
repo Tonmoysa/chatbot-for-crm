@@ -51,6 +51,27 @@ _FIRST_REF_RE = re.compile(
     re.I | re.UNICODE,
 )
 
+_MODIFY_REQUEST_CACHE: dict[str, dict[str, Any] | None] = {}
+
+
+def clear_modify_request_cache(trace_id: str = "") -> None:
+    key = (trace_id or "").strip()
+    if not key:
+        _MODIFY_REQUEST_CACHE.clear()
+        return
+    prefix = f"{key}:"
+    for ck in list(_MODIFY_REQUEST_CACHE.keys()):
+        if ck == key or ck.startswith(prefix):
+            _MODIFY_REQUEST_CACHE.pop(ck, None)
+
+
+def message_references_explicit_expense_number(message: str) -> bool:
+    """True when user names a 1-based expense line — gate before modify LLM."""
+    raw = message or ""
+    if _NUMBERED_ITEM_RE.search(raw):
+        return True
+    return bool(re.search(r"\bexpense\s+\d+\b", raw, re.I))
+
 
 def build_which_item_clarify(
     *,
@@ -161,12 +182,21 @@ def _parse_modify_request_llm(
         result["category"] = parsed["category"]
     if parsed.get("match_amount") is not None:
         result["match_amount"] = parsed["match_amount"]
-    frm = str(parsed.get("from_location") or "").strip()
-    to = str(parsed.get("to_location") or "").strip()
-    if frm and to:
-        result["from_location"] = frm
-        result["to_location"] = to
-    if result.get("amount") is None and not (frm and to):
+    from chat.services.platform.field_extractors.expense import _coerce_route_dict
+
+    route = _coerce_route_dict(
+        {
+            "from_location": parsed.get("from_location"),
+            "to_location": parsed.get("to_location"),
+        }
+    )
+    if route:
+        result.update(route)
+    if (
+        result.get("amount") is None
+        and not route
+        and not result.get("category")
+    ):
         return None
     return result
 
@@ -433,24 +463,26 @@ def parse_multiple_item_indices(
         return []
 
     if candidate_indices:
-        ordered = sorted({int(i) for i in candidate_indices})
-        # When clarify listed a subset, numbers refer to positions in that list.
-        if len(ordered) < item_count:
-            indices: list[int] = []
-            for n in nums:
-                pos = n - 1
-                if 0 <= pos < len(ordered):
-                    indices.append(ordered[pos])
-            return sorted(set(indices))
+        ordered: list[int] = []
+        seen: set[int] = set()
+        for raw_idx in candidate_indices:
+            ii = int(raw_idx)
+            if ii not in seen:
+                seen.add(ii)
+                ordered.append(ii)
+        # Clarify UI numbers always refer to positions in the displayed list.
+        indices = []
+        for n in nums:
+            pos = n - 1
+            if 0 <= pos < len(ordered):
+                indices.append(ordered[pos])
+        return sorted(set(indices))
 
     indices = []
     for n in nums:
         idx = n - 1
         if 0 <= idx < item_count:
             indices.append(idx)
-    if candidate_indices is not None:
-        allowed = {int(i) for i in candidate_indices}
-        indices = [i for i in indices if i in allowed]
     return sorted(set(indices))
 
 
@@ -543,6 +575,21 @@ def parse_route_modify_request(message: str, items: list[dict]) -> dict[str, Any
     }
 
 
+def _modify_request_cache_key(message: str, items: list[dict], *, trace_id: str = "") -> str:
+    tid = (trace_id or "").strip()
+    if not tid:
+        return ""
+    import hashlib
+
+    msg = (message or "").strip().lower()
+    sig = f"{len(items)}:" + ",".join(
+        f"{i.get('category')}|{i.get('amount')}|{i.get('from_location')}|{i.get('to_location')}"
+        for i in items
+    )
+    digest = hashlib.sha256(f"{msg}\0{sig}".encode()).hexdigest()[:20]
+    return f"{tid}:{digest}"
+
+
 def parse_modify_request(
     message: str,
     items: list[dict],
@@ -554,12 +601,23 @@ def parse_modify_request(
     if not items:
         return None
 
+    cache_key = _modify_request_cache_key(message, items, trace_id=trace_id)
+    if cache_key and cache_key in _MODIFY_REQUEST_CACHE:
+        cached = _MODIFY_REQUEST_CACHE[cache_key]
+        return dict(cached) if isinstance(cached, dict) else cached
+
+    result: dict[str, Any] | None = None
     if prefer_llm:
         from chat.services.platform.field_extractors.expense import _llm_client_configured
 
         if _llm_client_configured():
             llm_result = _parse_modify_request_llm(message, items, trace_id=trace_id)
             if llm_result is not None:
-                return llm_result
+                result = llm_result
 
-    return _parse_modify_request_regex(message, items)
+    if result is None:
+        result = _parse_modify_request_regex(message, items)
+
+    if cache_key:
+        _MODIFY_REQUEST_CACHE[cache_key] = dict(result) if isinstance(result, dict) else result
+    return result
