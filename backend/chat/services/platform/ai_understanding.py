@@ -1188,8 +1188,6 @@ class AIUnderstandingLayer:
         result = self._normalize_cross_workflow_understanding(
             message, result, memory=memory
         )
-        if result.workflow == "leave" and result.interrupt_workflow == "leave":
-            return enrich_answers_pending_field(message, memory, result)
         if result.workflow == "expense" and result.action == UnderstandingAction.REVIEW.value:
             return enrich_answers_pending_field(message, memory, result)
 

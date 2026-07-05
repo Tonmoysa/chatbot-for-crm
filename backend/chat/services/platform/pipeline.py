@@ -4730,9 +4730,26 @@ class WorkflowPipeline:
 
         requested = (memory.last_entities or {}).get("requested_leave_type")
         if requested and defn.workflow_id == "leave" and not draft.fields.get("leave_type"):
-            type_note = self.composer.unrecognized_leave_type_prompt(str(requested), lang=lang)
-            if type_note and type_note not in prefix:
-                prefix = f"{prefix}\n\n{type_note}".strip() if prefix else type_note
+            from chat.services.platform.field_extractors.leave import normalize_leave_type_value
+            from chat.services.platform.schemas import FieldUpdate
+
+            canonical = normalize_leave_type_value(requested)
+            if canonical:
+                state.apply_field_updates(
+                    [FieldUpdate(field="leave_type", value=canonical)],
+                    message="",
+                )
+                state.push(
+                    "merge_last_entities",
+                    value={"requested_leave_type": None},
+                )
+                draft = memory.active_draft() or draft
+            else:
+                type_note = self.composer.unrecognized_leave_type_prompt(
+                    str(requested), lang=lang
+                )
+                if type_note and type_note not in prefix:
+                    prefix = f"{prefix}\n\n{type_note}".strip() if prefix else type_note
 
         self._push_default_expense_date(state, memory)
         missing = self.fields.missing_fields(draft, defn)
