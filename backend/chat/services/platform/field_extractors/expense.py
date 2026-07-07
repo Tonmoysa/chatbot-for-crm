@@ -2101,40 +2101,59 @@ def _fresh_draft_phrase_match(message: str) -> bool:
     return any(p in low for p in phrases)
 
 
-def user_requests_fresh_expense_draft(
+_EXPENSE_ADD_ACTION_CACHE: dict[str, str] = {}
+
+
+def resolve_expense_add_action(
     message: str,
     memory=None,
     *,
     trace_id: str = "",
-) -> bool:
-    """True when user wants to discard pending draft and start fresh — not merge."""
+) -> str:
+    """LLM: merge_pending | fresh_discard | new_claim — how to handle a new expense message."""
     raw = (message or "").strip()
     if not raw:
-        return False
+        return "new_claim"
+
+    cache_key = f"{(trace_id or '').strip()}:{raw}"
+    if cache_key in _EXPENSE_ADD_ACTION_CACHE:
+        return _EXPENSE_ADD_ACTION_CACHE[cache_key]
+
+    has_pending = False
+    item_count = 0
+    if memory is not None:
+        has_pending = memory_has_expense_draft(memory)
+        _, draft = resolve_expense_working_draft(memory)
+        if draft:
+            item_count = _draft_expense_item_count(draft)
+        blocked = get_expense_blocked_add(memory)
+        if blocked and blocked.get("item_patches"):
+            has_pending = True
+
     if _fresh_draft_phrase_match(raw):
-        return True
-    if memory is not None and not memory_has_expense_draft(memory):
-        return False
+        action = "fresh_discard" if has_pending else "new_claim"
+        _EXPENSE_ADD_ACTION_CACHE[cache_key] = action
+        return action
+
+    if not has_pending:
+        _EXPENSE_ADD_ACTION_CACHE[cache_key] = "new_claim"
+        return "new_claim"
+
     if not _llm_client_configured():
-        return False
+        _EXPENSE_ADD_ACTION_CACHE[cache_key] = "merge_pending"
+        return "merge_pending"
+
     from chat.services.llm_client import llm_rate_limit_active
 
     if llm_rate_limit_active(trace_id or "", scope="expense-fresh-draft"):
-        return False
+        _EXPENSE_ADD_ACTION_CACHE[cache_key] = "merge_pending"
+        return "merge_pending"
 
     import json
 
     from chat.services.llm_client import LLMClient
     from chat.services.platform.llm_prompts import EXPENSE_FRESH_DRAFT_INTENT_SYSTEM
 
-    has_pending = False
-    item_count = 0
-    if memory is not None:
-        _, draft = resolve_expense_working_draft(memory)
-        if draft:
-            items = list((draft.fields or {}).get("items") or [])
-            item_count = len(items)
-            has_pending = item_count > 0
     payload = {
         "message": raw,
         "has_pending_draft": has_pending,
@@ -2147,14 +2166,36 @@ def user_requests_fresh_expense_draft(
         scope="expense-fresh-draft",
     )
     if not isinstance(parsed, dict):
-        return False
-    if not parsed.get("fresh_draft"):
-        return False
+        _EXPENSE_ADD_ACTION_CACHE[cache_key] = "merge_pending"
+        return "merge_pending"
+
+    action = str(parsed.get("action") or "").strip().lower()
+    if not action:
+        action = "fresh_discard" if parsed.get("fresh_draft") else "merge_pending"
+    if action not in ("merge_pending", "fresh_discard", "new_claim"):
+        action = "merge_pending"
+
     try:
         conf = float(parsed.get("confidence") or 0)
     except (TypeError, ValueError):
         conf = 0.0
-    return conf >= 0.65
+
+    if action == "fresh_discard" and conf < 0.65:
+        action = "merge_pending"
+    if action == "new_claim" and has_pending:
+        action = "merge_pending"
+    _EXPENSE_ADD_ACTION_CACHE[cache_key] = action
+    return action
+
+
+def user_requests_fresh_expense_draft(
+    message: str,
+    memory=None,
+    *,
+    trace_id: str = "",
+) -> bool:
+    """True when user wants to discard pending draft and start fresh — not merge."""
+    return resolve_expense_add_action(message, memory, trace_id=trace_id) == "fresh_discard"
 
 
 def resolve_expense_fresh_claim(
@@ -2166,12 +2207,15 @@ def resolve_expense_fresh_claim(
     fresh_claim_hint: bool = False,
 ) -> bool:
     """Whether to clear pending expense draft before applying this message."""
-    if user_requests_fresh_expense_draft(message, memory, trace_id=trace_id):
+    action = resolve_expense_add_action(message, memory, trace_id=trace_id)
+    if action == "fresh_discard":
         return True
-    if fresh_claim_hint:
-        return True
+    if action == "merge_pending":
+        return False
     if memory is not None and memory_has_expense_draft(memory):
         return False
+    if fresh_claim_hint:
+        return True
     return (active_id or "").strip().lower() != "expense"
 
 
@@ -2878,6 +2922,11 @@ def interpret_expense_draft_turn(
     turn = _merge_clarify_delete_with_rules(turn, raw, memory)
     turn = finalize_expense_turn_patches(turn, message, memory, trace_id=trace_id)
     date_rejected = False
+    merge_pending = (
+        not fresh_claim
+        and memory is not None
+        and memory_has_expense_draft(memory)
+    )
     if expense_turn_is_new_add(turn, raw):
         turn, date_rejected = coerce_expense_date_policy(
             turn,
@@ -2885,6 +2934,7 @@ def interpret_expense_draft_turn(
             memory=memory,
             trace_id=trace_id,
             conversation_history=conversation_history,
+            merge_pending=merge_pending,
         )
     elif not turn.get("incurred_date"):
         turn = {**turn, "incurred_date": today}
@@ -3132,6 +3182,11 @@ def expense_turn_to_field_updates(
     turn = normalize_expense_mutation_turn(turn, message, memory)
     turn = sanitize_expense_llm_patches(turn, message, memory)
     intent = str(turn.get("intent") or "").lower()
+    merge_pending = (
+        not fresh_claim
+        and memory is not None
+        and memory_has_expense_draft(memory)
+    )
     if intent == "clarify_delete" and not turn.get("item_patches") and not turn.get("delete_indices"):
         return turn, []
     if intent == "clarify_modify" and not turn.get("item_patches"):
@@ -3148,6 +3203,7 @@ def expense_turn_to_field_updates(
             memory=memory,
             trace_id=trace_id,
             conversation_history=conversation_history,
+            merge_pending=merge_pending,
         )
     intent = str(turn.get("intent") or "").lower()
     if date_rejected or intent == "date_not_allowed":
@@ -3487,6 +3543,7 @@ def coerce_expense_date_policy(
     memory=None,
     trace_id: str = "",
     conversation_history: list[str] | None = None,
+    merge_pending: bool = False,
 ) -> tuple[dict[str, Any], bool]:
     """Block non-today dates (LLM) on new adds only; replay stashed add on correction."""
     from datetime import date
@@ -3528,6 +3585,14 @@ def coerce_expense_date_policy(
     sem_coerced = _coerce_llm_date_output(sem_iso) if sem_iso else None
     effective_iso = sem_coerced or turn_iso
     date_effect = str(semantics.get("date_effect") or "unspecified").lower()
+
+    if merge_pending and date_effect in ("unspecified", "today", ""):
+        if not out.get("incurred_date"):
+            out["incurred_date"] = today
+        else:
+            iso = _coerce_llm_date_output(out.get("incurred_date"))
+            out["incurred_date"] = iso or today
+        return out, False
 
     rejected = False
     if date_effect == "non_today":
@@ -3659,6 +3724,19 @@ def dedupe_expense_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [dict(i) for i in items if isinstance(i, dict)]
 
 
+def read_expense_draft_fields(draft: WorkflowDraft | None) -> dict[str, Any]:
+    """Read expense fields — fall back to legacy line_items when fields.items is empty."""
+    if not draft:
+        return sync_expense_draft_fields({})
+    fields = dict(getattr(draft, "fields", None) or {})
+    items = list(fields.get("items") or [])
+    if not items:
+        legacy = list(getattr(draft, "line_items", None) or [])
+        if legacy:
+            fields = {**fields, "items": legacy}
+    return sync_expense_draft_fields(fields)
+
+
 def sync_expense_draft_fields(fields: dict[str, Any]) -> dict[str, Any]:
     """Recompute per-item missing_fields and status — never drop existing data."""
     out = dict(fields or {})
@@ -3674,7 +3752,7 @@ def sync_expense_draft_fields(fields: dict[str, Any]) -> dict[str, Any]:
 
 
 def sync_expense_draft(draft: WorkflowDraft) -> None:
-    draft.fields = sync_expense_draft_fields(draft.fields)
+    draft.fields = read_expense_draft_fields(draft)
     draft.line_items = list(draft.fields.get("items") or [])
 
 
@@ -4569,7 +4647,11 @@ def normalize_pending_edit_turn(
 def _draft_expense_item_count(draft: WorkflowDraft | None) -> int:
     if not draft:
         return 0
-    return len(list((getattr(draft, "fields", None) or {}).get("items") or []))
+    fields = dict(getattr(draft, "fields", None) or {})
+    items = list(fields.get("items") or [])
+    if items:
+        return len(items)
+    return len(list(getattr(draft, "line_items", None) or []))
 
 
 def _expense_draft_has_items(draft: WorkflowDraft | None) -> bool:
@@ -5250,6 +5332,28 @@ def expense_draft_llm_user_payload(
     """Minimal JSON for expense-draft LLM — keeps input tokens low."""
     aw = memory.active_workflow.id if memory.active_workflow else ""
     if fresh_claim or aw != "expense":
+        if not fresh_claim and memory:
+            _, working = resolve_expense_working_draft(memory)
+            if working and _draft_expense_item_count(working) > 0:
+                sync_expense_draft(working)
+                items = compact_draft_items_for_llm(
+                    list((working.fields or {}).get("items") or [])
+                )
+                payload: dict[str, Any] = {
+                    "message": message,
+                    "today_iso": today_iso,
+                    "stage": "collecting",
+                    "pending_confirmation": "",
+                    "items": items,
+                    "has_pending_draft": True,
+                }
+                fields = dict(working.fields or {})
+                if fields.get("incurred_date"):
+                    payload["incurred_date"] = fields.get("incurred_date")
+                blocked = get_expense_blocked_add(memory)
+                if blocked:
+                    payload["blocked_add"] = _blocked_add_summary(blocked)
+                return payload
         return {
             "message": message,
             "today_iso": today_iso,
@@ -5285,7 +5389,7 @@ def expense_draft_llm_user_payload(
 
 def draft_context_payload(memory: SessionMemory, *, compact: bool = True) -> dict[str, Any]:
     draft = memory.active_draft()
-    fields = sync_expense_draft_fields(dict(draft.fields if draft else {}))
+    fields = read_expense_draft_fields(draft) if draft else sync_expense_draft_fields({})
     items = list(fields.get("items") or [])
     pq = memory.pending_question
     focus = build_pending_focus(memory)

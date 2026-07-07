@@ -481,6 +481,7 @@ def reduce_clear_draft_fields(memory: SessionMemory, draft_id: str = "default") 
     draft = memory.workflow_drafts.get(draft_id)
     if draft:
         draft.fields = {}
+        draft.line_items = []
         draft.version += 1
 
 
@@ -690,6 +691,20 @@ def reduce_reconcile_expense_session(memory: SessionMemory) -> bool:
 
     drafts = memory.workflow_drafts or {}
     changed = False
+
+    for _did, draft in list(drafts.items()):
+        if not draft or getattr(draft, "workflow_id", None) != "expense":
+            continue
+        field_items = list((getattr(draft, "fields", None) or {}).get("items") or [])
+        line_items = list(getattr(draft, "line_items", None) or [])
+        if field_items or not line_items:
+            continue
+        synced = sync_expense_draft_fields({**(draft.fields or {}), "items": line_items})
+        draft.fields = synced
+        draft.line_items = list(synced.get("items") or [])
+        draft.version = int(getattr(draft, "version", 0) or 0) + 1
+        changed = True
+
     orphaned_items: list[dict[str, Any]] = []
     orphaned_incurred: str | None = None
     polluted: list[tuple[str, dict[str, Any]]] = []

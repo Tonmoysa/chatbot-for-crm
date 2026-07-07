@@ -138,16 +138,6 @@ def _patch_workflow_show_review_wf_id() -> None:
                     wf = (understanding.workflow or "").strip().lower()
                     wf_id = wf if wf in valid else ""
 
-            if wf_id == "expense":
-                from chat.services.platform.field_extractors.expense import memory_has_expense_draft
-
-                state = rest["state"]
-                if memory_has_expense_draft(memory) and (
-                    not memory.active_workflow or memory.active_workflow.id != "expense"
-                ):
-                    state.push("switch_to_workflow", value="expense")
-                    state.flush()
-
             if wf_id in valid and (understanding.workflow or "").strip().lower() not in valid:
                 understanding = UnderstandingResult(
                     goal=understanding.goal,

@@ -6,10 +6,12 @@ from typing import Any
 
 from chat.services.platform.field_extractors import format_iso_date_display
 from chat.services.platform.field_extractors.expense import (
+    _draft_expense_item_count,
     category_display_name,
     is_travel_category,
     is_valid_expense_route,
     normalize_expense_category,
+    read_expense_draft_fields,
     sync_expense_draft_fields,
 )
 from chat.services.session_memory import SessionMemory, WorkflowDraft
@@ -226,8 +228,7 @@ def format_expense_status_report(
         open_drafts.append(draft)
 
     if focus_draft and not focus_draft.locked and focus_draft not in open_drafts:
-        items = list((focus_draft.fields or {}).get("items") or [])
-        if items:
+        if _draft_expense_item_count(focus_draft) > 0:
             open_drafts.insert(0, focus_draft)
 
     if scope_key == "submitted":
@@ -288,7 +289,7 @@ def format_expense_status_report(
         header = "**Pending expense (submit hoyni)**" if lang in ("bn", "banglish") else "**Pending expenses (not submitted)**"
         lines.append(header)
         for draft in open_drafts:
-            fields = sync_expense_draft_fields(dict(draft.fields or {}))
+            fields = read_expense_draft_fields(draft)
             items = list(fields.get("items") or [])
             for i, item in enumerate(items, 1):
                 if isinstance(item, dict):
@@ -319,7 +320,7 @@ def format_expense_collect_recap(
     include_focus_question: str | None = None,
 ) -> str:
     """Compact list + pending block shown after each expense collect turn."""
-    fields = sync_expense_draft_fields(dict(draft.fields or {}))
+    fields = read_expense_draft_fields(draft)
     items = fields.get("items") or []
     lines: list[str] = []
     for note in update_notes or []:

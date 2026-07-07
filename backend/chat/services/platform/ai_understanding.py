@@ -643,10 +643,14 @@ class AIUnderstandingLayer:
             active_id or "leave",
             conversation_history=conversation_history,
             trace_id=trace_id,
-            fresh_claim=True,
+            fresh_claim=False,
         )
+        from chat.services.platform.field_extractors.expense import resolve_expense_add_action
+
+        add_action = resolve_expense_add_action(message, memory, trace_id=trace_id)
         entities = dict(result.entities or {})
-        entities["expense_new_claim"] = True
+        entities["expense_add_action"] = add_action
+        entities["expense_new_claim"] = add_action in ("new_claim", "fresh_discard")
         result.entities = entities
         return result
 

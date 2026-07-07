@@ -161,6 +161,66 @@ class PlanBuilder:
         return target != active
 
     @staticmethod
+    def _expense_interrupt_needs_confirm_from_ctx(ctx: TurnContext) -> bool:
+        """Whether switching away from expense should ask for confirmation."""
+        if (ctx.active_workflow_id or "").strip().lower() != "expense":
+            return False
+        snapshot = ctx.draft_snapshot or {}
+        fields = snapshot.get("fields") if isinstance(snapshot.get("fields"), dict) else {}
+        items = list((fields or {}).get("items") or [])
+        line_items = list(snapshot.get("line_items") or [])
+        if items or line_items:
+            return True
+        return (ctx.pending_question_workflow_id or "").strip().lower() == "expense"
+
+    @staticmethod
+    def _expense_interrupt_needs_confirm(memory) -> bool:
+        from chat.services.platform.field_extractors.expense import (
+            get_expense_blocked_add,
+            memory_has_expense_draft,
+        )
+
+        if memory_has_expense_draft(memory):
+            return True
+        if get_expense_blocked_add(memory):
+            return True
+        aw = memory.active_workflow if memory else None
+        if aw and aw.id == "expense":
+            draft = memory.active_draft() if memory else None
+            if draft and len(list(getattr(draft, "line_items", None) or [])) > 0:
+                return True
+            pq = memory.pending_question if memory else None
+            if pq and pq.workflow_id == "expense":
+                return True
+        return False
+
+    @classmethod
+    def _cross_workflow_interrupt_plan(
+        cls,
+        ctx: TurnContext,
+        u: UnderstandingResult,
+        workflow_id: str,
+        reason: str,
+    ) -> ExecutionPlan:
+        active = (ctx.active_workflow_id or "").strip().lower()
+        if active == "expense" and not cls._expense_interrupt_needs_confirm_from_ctx(ctx):
+            target = (
+                (u.interrupt_workflow or u.workflow or workflow_id or "")
+                .strip()
+                .lower()
+            )
+            return ExecutionPlan(
+                ops=[PlanOp.WORKFLOW_SWITCH],
+                reason=f"{reason} — no pending expense",
+                workflow_id=target or workflow_id,
+            )
+        return ExecutionPlan(
+            ops=[PlanOp.MAYBE_WORKFLOW_SWITCH],
+            reason=reason,
+            workflow_id=workflow_id,
+        )
+
+    @staticmethod
     def _interrupts_submit_confirmation(
         u: UnderstandingResult,
         *,
@@ -250,7 +310,8 @@ class PlanBuilder:
         trace_id: str = "",
     ) -> bool:
         from chat.services.platform.field_extractors.expense import (
-            user_requests_fresh_expense_draft,
+            memory_has_expense_draft,
+            resolve_expense_add_action,
         )
         from chat.services.platform.intent_rules import (
             is_compound_expense_message,
@@ -258,16 +319,17 @@ class PlanBuilder:
             is_expense_message,
         )
 
-        if user_requests_fresh_expense_draft(message, memory, trace_id=trace_id):
+        action = resolve_expense_add_action(message, memory, trace_id=trace_id)
+        if action == "fresh_discard":
             return True
+        if action == "merge_pending" or memory_has_expense_draft(memory):
+            return False
         active = (active_workflow_id or "").strip().lower()
         if active == "expense":
             return False
         if is_expense_draft_query(message):
             return False
         u = understanding
-        if u and (u.entities or {}).get("expense_new_claim"):
-            return True
         if u and u.field_updates:
             return True
         expense_turn = dict((u.entities or {}).get("expense_turn") or {}) if u else {}
@@ -516,7 +578,9 @@ class PlanBuilder:
             active = (ctx.active_workflow_id or "").strip().lower()
             if workflow_id == "expense" and active == "leave":
                 return cls._build_post_submit_expense_start_plan(ctx, decision, u)
-            if workflow_id == "leave":
+            if active == "expense" and workflow_id == "leave":
+                return cls._build_submitted_expense_leave_navigation_plan(ctx, decision)
+            if workflow_id == "leave" and active == "leave":
                 return cls._build_locked_leave_plan(ctx, decision, workflow_id)
             if workflow_id == "expense":
                 return cls._build_locked_expense_plan(ctx, decision, workflow_id)
@@ -548,6 +612,52 @@ class PlanBuilder:
             return cls._build_workflow_active(workflow_id, ctx, decision, u)
 
         return cls._build_workflow_pending(workflow_id, ctx, decision, u)
+
+    @classmethod
+    def _build_submitted_expense_leave_navigation_plan(
+        cls,
+        ctx: TurnContext,
+        decision: TurnDecision,
+    ) -> ExecutionPlan:
+        """Expense claim already submitted — allow resume/show leave without editing expense."""
+        u = decision.understanding
+        pq = decision.pq
+        message = ctx.user_message or ""
+        from chat.services.platform.intent_rules import should_resume_suspended_leave
+
+        wants_leave = (
+            should_resume_suspended_leave(
+                message=message,
+                active_workflow_id=ctx.active_workflow_id,
+                suspended_workflows=ctx.suspended_workflows,
+            )
+            or (
+                pq
+                and pq.kind == MessageIntentKind.SWITCH_WORKFLOW
+                and pq.target_workflow == "leave"
+            )
+            or (u and u.interrupt_workflow == "leave")
+            or cls._is_cross_workflow_interrupt(ctx, u)
+        )
+        if wants_leave:
+            return ExecutionPlan(
+                ops=[PlanOp.WORKFLOW_SWITCH],
+                reason="resume leave after submitted expense",
+                workflow_id="leave",
+            )
+        if is_summary_request(message) or (
+            u and u.action == UnderstandingAction.REVIEW.value and u.workflow == "leave"
+        ):
+            return ExecutionPlan(
+                ops=[PlanOp.WORKFLOW_SHOW_REVIEW],
+                reason="leave summary while expense submitted",
+                workflow_id="leave",
+            )
+        return ExecutionPlan(
+            ops=[PlanOp.LOCKED_RESPONSE],
+            reason="post-submit expense active",
+            workflow_id="leave",
+        )
 
     @classmethod
     def _build_locked_leave_plan(
@@ -669,7 +779,23 @@ class PlanBuilder:
         u = decision.understanding
         message = ctx.user_message or ""
         pq = decision.pq
+        from chat.services.platform.intent_rules import should_resume_suspended_leave
         from chat.services.platform.turn_semantics import is_expense_review_request
+
+        if should_resume_suspended_leave(
+            message=message,
+            active_workflow_id=ctx.active_workflow_id,
+            suspended_workflows=ctx.suspended_workflows,
+        ) or (
+            pq
+            and pq.kind == MessageIntentKind.SWITCH_WORKFLOW
+            and pq.target_workflow == "leave"
+        ) or (u and u.interrupt_workflow == "leave"):
+            return ExecutionPlan(
+                ops=[PlanOp.WORKFLOW_SWITCH],
+                reason="resume leave from submitted expense",
+                workflow_id="leave",
+            )
 
         if is_expense_review_request(message, u) or (
             pq and pq.kind == MessageIntentKind.SHOW_REVIEW and pq.target_workflow == "expense"
@@ -834,10 +960,11 @@ class PlanBuilder:
         if cls._is_cross_workflow_interrupt(ctx, u) and not cls._is_expense_review_edit(
             ctx, u, message
         ):
-            return ExecutionPlan(
-                ops=[PlanOp.MAYBE_WORKFLOW_SWITCH],
+            return cls._cross_workflow_interrupt_plan(
+                ctx,
+                u,
+                workflow_id,
                 reason=f"cross-workflow during {workflow_id} submit",
-                workflow_id=workflow_id,
             )
 
         if (
@@ -1038,10 +1165,11 @@ class PlanBuilder:
             return None
         if PlanBuilder._is_expense_review_edit(ctx, u, msg):
             return None
-        return ExecutionPlan(
-            ops=[PlanOp.MAYBE_WORKFLOW_SWITCH],
+        return PlanBuilder._cross_workflow_interrupt_plan(
+            ctx,
+            u,
+            workflow_id,
             reason=f"confirm cross-workflow switch from {workflow_id}",
-            workflow_id=workflow_id,
         )
 
     @classmethod
@@ -1451,10 +1579,11 @@ class PlanBuilder:
         if cls._is_cross_workflow_interrupt(ctx, u) and not cls._is_expense_review_edit(
             ctx, u, message
         ):
-            return ExecutionPlan(
-                ops=[PlanOp.MAYBE_WORKFLOW_SWITCH],
+            return cls._cross_workflow_interrupt_plan(
+                ctx,
+                u,
+                workflow_id,
                 reason=f"cross-workflow interrupt during {workflow_id}",
-                workflow_id=workflow_id,
             )
 
         if u.action in (UnderstandingAction.START.value, UnderstandingAction.COLLECT.value) and u.field_updates:
@@ -1845,14 +1974,21 @@ class WorkflowPipeline:
                 "understanding": understanding.to_dict() if understanding else {},
             }
         if op == PlanOp.WORKFLOW_SHOW_REVIEW:
-            show_target = str((understanding.entities or {}).get("show_workflow_target") or wf_id or "").lower()
-            defn = get_workflow_definition(wf_id) or self._active_defn(memory)
-            if show_target == "leave" or (defn and defn.workflow_id == "leave"):
+            show_target = str(
+                (understanding.entities or {}).get("show_workflow_target")
+                or (understanding.workflow if understanding else "")
+                or wf_id
+                or ""
+            ).lower()
+            if show_target not in ("leave", "expense"):
+                show_target = (wf_id or "").lower()
+            if show_target == "leave":
                 body = self.composer.leave_status_report(memory, lang=lang)
                 return body, {
                     "outcome": "INFORMATIONAL",
                     "rules_applied": ["LEAVE_SESSION_SUMMARY"],
                 }
+            defn = get_workflow_definition(show_target) or self._active_defn(memory)
             if defn:
                 return self._show_review(
                     memory,
@@ -4520,7 +4656,15 @@ class WorkflowPipeline:
         trace_id: str = "",
     ) -> bool:
         """Re-parse expense narrative and apply patches (Phase A — switch / replay)."""
-        from chat.services.platform.field_extractors.expense import expense_turn_to_field_updates
+        from datetime import date
+
+        from chat.services.platform.field_extractors.expense import (
+            clear_expense_blocked_add,
+            expense_turn_to_field_updates,
+            get_expense_blocked_add,
+            patches_to_field_updates,
+            resolve_expense_working_draft,
+        )
 
         if not (message or "").strip():
             return False
@@ -4540,6 +4684,28 @@ class WorkflowPipeline:
             fresh_claim=fresh,
         )
         if not updates:
+            blocked = get_expense_blocked_add(memory)
+            if blocked and blocked.get("item_patches"):
+                _, working = resolve_expense_working_draft(memory)
+                fields = dict(working.fields or {}) if working else {"items": []}
+                today = date.today().isoformat()
+                replay_turn = {
+                    "intent": "add",
+                    "item_patches": list(blocked.get("item_patches") or []),
+                    "incurred_date": today,
+                }
+                pq = memory.pending_question
+                pending_idx = pq.item_index if pq and pq.workflow_id == "expense" else None
+                updates = patches_to_field_updates(
+                    fields,
+                    replay_turn,
+                    pending_item_index=pending_idx,
+                )
+                if updates:
+                    state.apply_field_updates(updates)
+                    clear_expense_blocked_add(memory)
+                    self._push_default_expense_date(state, memory)
+                    return True
             return False
         state.apply_field_updates(updates)
         self._push_default_expense_date(state, memory)

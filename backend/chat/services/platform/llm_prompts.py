@@ -502,32 +502,41 @@ FEW-SHOT
 - "kalke lunch 100 bus 120 mirpur to badda" → lunch 100, bus 120 with route
 """
 
-EXPENSE_FRESH_DRAFT_INTENT_SYSTEM = """Decide if user wants to DISCARD the current pending expense draft and start completely fresh.
+EXPENSE_FRESH_DRAFT_INTENT_SYSTEM = """Decide how a new expense message should relate to any pending expense draft in the session.
 Return ONLY valid JSON:
 {
-  "fresh_draft": true|false,
+  "action": "merge_pending|fresh_discard|new_claim",
   "confidence": 0.0-1.0,
   "reasoning": ""
 }
 
-fresh_draft=true ONLY when user explicitly asks to:
+ACTIONS
+- merge_pending: add line items to the existing pending expense draft (default when pending exists)
+- fresh_discard: cancel/clear the pending draft and start completely fresh
+- new_claim: no pending draft exists — start a new expense claim
+
+fresh_discard ONLY when user explicitly asks to:
 - cancel/clear/discard/reset the current pending expense draft and start over
 - "agrer expense cancel koro", "purono draft clear koro", "notun expense shuru koro" (start over — not listing items)
 - "clear draft", "fresh expense", "reset expense"
 
-fresh_draft=false when:
-- User lists expense line items with amounts (lunch 100, bus 30, etc.) — merge into existing draft
+merge_pending when:
+- User lists expense line items with amounts (lunch 100, bus 30, etc.) — even if they say "new expense hisabe add"
 - User answers a pending question (route, category, amount)
 - User wants to add more items to the existing draft
-- User asks for summary, submit, or modify a specific line
-- Ambiguous — prefer false (merge) when items with amounts are present
+- User asks to modify a specific line while keeping the rest
+- Ambiguous with amounts present — prefer merge_pending
+
+new_claim when:
+- has_pending_draft is false and user is submitting expense line items
 
 FEW-SHOT:
-- pending draft exists, "100 lunch, 30 bus" → fresh_draft=false (merge)
-- "agrer expense cancel kore notun shuru koro" → fresh_draft=true
-- "clear draft lunch 100" → fresh_draft=true (clear then user may add — still fresh)
-- "notun expense shuru koro" with no amounts → fresh_draft=true
-- "notun expense lunch 100" → fresh_draft=false (adding with notun phrasing but has items)
+- pending draft exists, "100 lunch, 30 bus" → merge_pending
+- pending draft exists, "bus 30 taka uttora to mirpur eta new expense hisabe add koro" → merge_pending
+- "agrer expense cancel kore notun shuru koro" → fresh_discard
+- "clear draft lunch 100" → fresh_discard
+- no pending, "lunch 100 taka" → new_claim
+- pending exists, "notun expense shuru koro" with no amounts → fresh_discard
 """
 
 EXPENSE_SLOT_FROM_HISTORY_SYSTEM = """Extract ONE expense slot value from a prior user message.
